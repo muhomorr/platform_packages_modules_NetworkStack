@@ -16,6 +16,7 @@
 
 package android.net.ip;
 
+import static android.net.util.NetworkStackUtils.IPCLIENT_PARSE_NETLINK_EVENTS_VERSION;
 import static android.system.OsConstants.RT_SCOPE_UNIVERSE;
 
 import static org.junit.Assert.assertArrayEquals;
@@ -25,6 +26,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.anyBoolean;
 import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.eq;
@@ -110,7 +112,7 @@ public class IpClientTest {
     private static final int TEST_IFINDEX = 1001;
     // See RFC 7042#section-2.1.2 for EUI-48 documentation values.
     private static final MacAddress TEST_MAC = MacAddress.fromString("00:00:5E:00:53:01");
-    private static final int TEST_TIMEOUT_MS = 400;
+    private static final int TEST_TIMEOUT_MS = 30_000;
     private static final String TEST_L2KEY = "some l2key";
     private static final String TEST_CLUSTER = "some cluster";
     private static final String TEST_SSID = "test_ssid";
@@ -164,6 +166,8 @@ public class IpClientTest {
         when(mDependencies.getIpMemoryStore(mContext, mNetworkStackServiceManager))
                 .thenReturn(mIpMemoryStore);
         when(mDependencies.getIpConnectivityLog()).thenReturn(mMetricsLog);
+        when(mDependencies.isFeatureEnabled(eq(mContext),
+                eq(IPCLIENT_PARSE_NETLINK_EVENTS_VERSION), anyBoolean())).thenReturn(false);
 
         mIfParams = null;
     }
