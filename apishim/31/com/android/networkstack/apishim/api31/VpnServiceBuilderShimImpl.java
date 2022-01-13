@@ -14,20 +14,11 @@
  * limitations under the License.
  */
 
-package com.android.networkstack.apishim;
-
-import android.os.Build;
-
-import androidx.annotation.RequiresApi;
-
-import com.android.networkstack.apishim.common.SettingsShim;
+package com.android.networkstack.apishim.api31;
 
 /**
- * Compatibility implementation of {@link SettingsShim} for API 31.
+ * Implementation of {@link com.android.networkstack.apishim.common.VpnServiceBuilderShim}.
  */
-@RequiresApi(Build.VERSION_CODES.S) // Change to T when version code available, and adding T methods
-public class SettingsShimImpl
-        extends com.android.networkstack.apishim.api30.SettingsShimImpl {
-    // Currently identical to the API 31 shim, so inherit everything
-    protected SettingsShimImpl() { }
+public class VpnServiceBuilderShimImpl extends
+        com.android.networkstack.apishim.api29.VpnServiceBuilderShimImpl {
 }

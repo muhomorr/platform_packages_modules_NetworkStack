@@ -20,16 +20,14 @@ import android.os.Build;
 
 import androidx.annotation.RequiresApi;
 
-import com.android.networkstack.apishim.common.NetworkRequestShim;
+import com.android.networkstack.apishim.common.SettingsShim;
 
 /**
- * Implementation of {@link NetworkRequestShim} for API 31.
+ * Compatibility implementation of {@link SettingsShim} for API 33.
  */
-@RequiresApi(Build.VERSION_CODES.S) // Change to T when version code available, and adding T methods
-public class NetworkRequestShimImpl
-        extends com.android.networkstack.apishim.api31.NetworkRequestShimImpl {
+@RequiresApi(Build.VERSION_CODES.TIRAMISU)
+public class SettingsShimImpl
+        extends com.android.networkstack.apishim.api30.SettingsShimImpl {
     // Currently identical to the API 31 shim, so inherit everything
-    protected NetworkRequestShimImpl() {
-        super();
-    }
+    protected SettingsShimImpl() { }
 }
