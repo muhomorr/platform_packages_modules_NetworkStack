@@ -19,8 +19,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
   package="com.android.networkstack"
   android:sharedUserId="android.uid.networkstack"
-  android:versionCode="311811000"
-  android:versionName="aml_net_311811000"
+  android:versionCode="311811010"
+  android:versionName="aml_net_311811010"
   coreApp="true"
 >
     <!-- Permissions must be defined here, and not in the base manifest, as the network stack
