@@ -61,6 +61,7 @@ import static android.provider.DeviceConfig.NAMESPACE_CONNECTIVITY;
 import static com.android.networkstack.util.DnsUtils.PRIVATE_DNS_PROBE_HOST_SUFFIX;
 import static com.android.server.connectivity.NetworkMonitor.INITIAL_REEVALUATE_DELAY_MS;
 import static com.android.server.connectivity.NetworkMonitor.extractCharset;
+import static com.android.testutils.DevSdkIgnoreRuleKt.SC_V2;
 
 import static junit.framework.Assert.assertEquals;
 import static junit.framework.Assert.assertFalse;
@@ -115,6 +116,7 @@ import android.net.INetworkMonitorCallbacks;
 import android.net.InetAddresses;
 import android.net.LinkProperties;
 import android.net.Network;
+import android.net.NetworkAgentConfig;
 import android.net.NetworkCapabilities;
 import android.net.NetworkTestResultParcelable;
 import android.net.Uri;
@@ -263,6 +265,7 @@ public class NetworkMonitorTest {
     private @Mock WifiInfo mWifiInfo;
 
     private static final int TEST_NETID = 4242;
+    private static final int TEST_NETID2 = 2121;
     private static final String TEST_HTTP_URL = "http://www.google.com/gen_204";
     private static final String TEST_HTTP_OTHER_URL1 = "http://other1.google.com/gen_204";
     private static final String TEST_HTTP_OTHER_URL2 = "http://other2.google.com/gen_204";
@@ -1502,6 +1505,52 @@ public class NetworkMonitorTest {
         runCapportApiInvalidUrlTest("ThisIsNotAValidUrl");
     }
 
+    @Test @IgnoreUpTo(SC_V2)
+    public void testVpnReevaluationWhenUnderlyingNetworkChange() throws Exception {
+        // Skip this test if the test is built against SDK < T
+        assumeTrue(ConstantsShim.VERSION > SC_V2);
+        // Start a VPN network
+        final NetworkCapabilities nc = new NetworkCapabilities.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
+                .removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .build();
+        setStatus(mHttpsConnection, 204);
+        setStatus(mHttpConnection, 204);
+        final NetworkAgentConfigShim config = NetworkAgentConfigShimImpl.newInstance(
+                new NetworkAgentConfig.Builder().setVpnRequiresValidation(true).build());
+        final NetworkMonitor nm = runNetworkTest(config, TEST_LINK_PROPERTIES, nc,
+                NETWORK_VALIDATION_RESULT_VALID,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS, null);
+
+        reset(mCallbacks);
+        // Underlying network changed.
+        notifyUnderlyingNetworkChange(nm, nc , List.of(new Network(TEST_NETID)));
+        // The underlying network change should cause a re-validation
+        verifyNetworkTested(NETWORK_VALIDATION_RESULT_VALID,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS);
+
+        reset(mCallbacks);
+        notifyUnderlyingNetworkChange(nm, nc , List.of(new Network(TEST_NETID)));
+        // Identical networks should not cause revalidation.
+        verify(mCallbacks, never()).notifyNetworkTestedWithExtras(matchNetworkTestResultParcelable(
+                NETWORK_VALIDATION_RESULT_VALID,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS));
+
+        reset(mCallbacks);
+        // Change to another network
+        notifyUnderlyingNetworkChange(nm, nc , List.of(new Network(TEST_NETID2)));
+        verifyNetworkTested(NETWORK_VALIDATION_RESULT_VALID,
+                NETWORK_VALIDATION_PROBE_DNS | NETWORK_VALIDATION_PROBE_HTTPS);
+    }
+
+    private void notifyUnderlyingNetworkChange(NetworkMonitor nm, NetworkCapabilities nc,
+            List<Network> underlyingNetworks) {
+        final NetworkCapabilities newNc = new NetworkCapabilities.Builder(nc)
+                .setUnderlyingNetworks(underlyingNetworks).build();
+        nm.notifyNetworkCapabilitiesChanged(newNc);
+        HandlerUtils.waitForIdle(nm.getHandler(), HANDLER_TIMEOUT_MS);
+    }
+
     @Test @IgnoreUpTo(Build.VERSION_CODES.Q)
     public void testIsCaptivePortal_CapportApiNotSupported() throws Exception {
         // Test that on a R+ device, if NetworkStack was compiled without CaptivePortalData support
@@ -2025,8 +2074,7 @@ public class NetworkMonitorTest {
         // The network should still be valid.
         verify(mCallbacks, timeout(HANDLER_TIMEOUT_MS).atLeastOnce())
                 .notifyNetworkTestedWithExtras(matchNetworkTestResultParcelable(
-                        NETWORK_VALIDATION_RESULT_VALID, 0 /* probesSucceeded */,
-                        TEST_LOGIN_URL));
+                        NETWORK_VALIDATION_RESULT_VALID, 0 /* probesSucceeded */));
     }
 
     @Test

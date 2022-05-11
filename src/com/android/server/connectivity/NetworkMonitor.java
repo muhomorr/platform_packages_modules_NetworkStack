@@ -1066,7 +1066,15 @@ public class NetworkMonitor extends StateMachine {
                     }
                     break;
                 case EVENT_NETWORK_CAPABILITIES_CHANGED:
-                    mNetworkCapabilities = (NetworkCapabilities) message.obj;
+                    final NetworkCapabilities newCap = (NetworkCapabilities) message.obj;
+                    // Reevaluate network if underlying network changes on the validation required
+                    // VPN.
+                    if (isVpnUnderlyingNetworkChangeReevaluationRequired(
+                            newCap, mNetworkCapabilities)) {
+                        sendMessage(CMD_FORCE_REEVALUATION, NO_UID, 0);
+                    }
+
+                    mNetworkCapabilities = newCap;
                     suppressNotificationIfNetworkRestricted();
                     break;
                 case EVENT_RESOURCE_CONFIG_CHANGED:
@@ -1084,6 +1092,14 @@ public class NetworkMonitor extends StateMachine {
                     break;
             }
             return HANDLED;
+        }
+
+        private boolean isVpnUnderlyingNetworkChangeReevaluationRequired(
+                final NetworkCapabilities newCap, final NetworkCapabilities oldCap) {
+            return !newCap.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                    && isValidationRequired()
+                    && !Objects.equals(mInfoShim.getUnderlyingNetworks(newCap),
+                    mInfoShim.getUnderlyingNetworks(oldCap));
         }
 
         @Override
@@ -1392,6 +1408,7 @@ public class NetworkMonitor extends StateMachine {
                         // validation and private DNS validation.
                         validationLog("Captive portal is used as is, resolving private DNS");
                         transitionTo(mEvaluatingPrivateDnsState);
+                        return HANDLED;
                     } else if (!isValidationRequired()) {
                         if (isPrivateDnsValidationRequired()) {
                             validationLog("Network would not satisfy default request, "
