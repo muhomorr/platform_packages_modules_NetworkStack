@@ -194,7 +194,6 @@ java_library {
     ],
     static_libs: [
         "networkstack-aidl-latest",
-        "modules-utils-build",
     ],
     visibility: [
         "//frameworks/base/packages/Connectivity/service",
@@ -205,10 +204,12 @@ java_library {
         "//packages/apps/Bluetooth",
         "//packages/modules/Bluetooth/android/app",
         "//packages/modules/NetworkStack",
+        "//packages/modules/Wifi/service",
     ],
     apex_available: [
         "//apex_available:platform",
         "com.android.bluetooth",
         "com.android.tethering",
+        "com.android.wifi",
     ],
 }
