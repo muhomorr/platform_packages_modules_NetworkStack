@@ -21,22 +21,9 @@ package {
     default_applicable_licenses: ["Android-Apache-2.0"],
 }
 
-// TODO: remove this filegroup together with services.net
-filegroup {
-    name: "net-module-utils-srcs",
-    srcs: [
-        "src/android/net/shared/NetdUtils.java",
-        "src/android/net/util/SharedLog.java",
-    ],
-    visibility: [
-        "//frameworks/base/services/net",
-    ]
-}
-
 filegroup {
     name: "connectivity-module-utils-srcs",
     srcs: [
-        "src/android/net/util/SharedLog.java",
         "src/android/net/shared/NetdUtils.java",
         "src/android/net/shared/NetworkMonitorUtils.java",
     ],
@@ -47,7 +34,9 @@ filegroup {
 
 filegroup {
     name: "networkstack-module-utils-srcs",
-    srcs: ["src/**/*.java"],
+    srcs: [
+        "src/android/net/shared/*.java",
+    ],
     visibility: [
         "//packages/modules/NetworkStack",
     ]
@@ -57,12 +46,7 @@ filegroup {
 filegroup {
     name: "tethering-module-utils-srcs",
     srcs: [
-        "src/android/net/ip/ConntrackMonitor.java",
-        "src/android/net/ip/InterfaceController.java",
-        "src/android/net/ip/IpNeighborMonitor.java",
-        "src/android/net/ip/NetlinkMonitor.java",
         "src/android/net/shared/NetdUtils.java",
-        "src/android/net/util/SharedLog.java",
     ],
     visibility: [
         "//frameworks/base/packages/Tethering",
