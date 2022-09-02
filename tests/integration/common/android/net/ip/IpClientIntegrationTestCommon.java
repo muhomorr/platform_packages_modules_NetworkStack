@@ -144,7 +144,6 @@ import android.net.networkstack.aidl.ip.ReachabilityLossReason;
 import android.net.shared.Layer2Information;
 import android.net.shared.ProvisioningConfiguration;
 import android.net.shared.ProvisioningConfiguration.ScanResultInfo;
-import android.net.util.NetworkStackUtils;
 import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -180,15 +179,16 @@ import com.android.networkstack.apishim.CaptivePortalDataShimImpl;
 import com.android.networkstack.apishim.ConstantsShim;
 import com.android.networkstack.apishim.common.ShimUtils;
 import com.android.networkstack.arp.ArpPacket;
+import com.android.networkstack.ipmemorystore.IpMemoryStoreService;
 import com.android.networkstack.metrics.IpProvisioningMetrics;
 import com.android.networkstack.metrics.IpReachabilityMonitorMetrics;
 import com.android.networkstack.metrics.NetworkQuirkMetrics;
 import com.android.networkstack.packets.NeighborAdvertisement;
 import com.android.networkstack.packets.NeighborSolicitation;
+import com.android.networkstack.util.NetworkStackUtils;
 import com.android.server.NetworkObserver;
 import com.android.server.NetworkObserverRegistry;
 import com.android.server.NetworkStackService.NetworkStackServiceManager;
-import com.android.server.connectivity.ipmemorystore.IpMemoryStoreService;
 import com.android.testutils.DevSdkIgnoreRule;
 import com.android.testutils.DevSdkIgnoreRule.IgnoreAfter;
 import com.android.testutils.DevSdkIgnoreRule.IgnoreUpTo;
@@ -3174,10 +3174,15 @@ public abstract class IpClientIntegrationTestCommon {
         }
         final int after = getNumOpenFds();
 
-        // Check that the number of open fds is the same as before.
-        // If this exact match becomes flaky, we could add some tolerance here (e.g., allow 2-3
-        // extra fds), since it's likely that any leak would at least leak one FD per loop.
-        assertEquals("Fd leak after " + iterations + " iterations: ", before, after);
+        // Check that the number of open fds is the same as before, within some tolerance (e.g.,
+        // garbage collection or other cleanups might have caused an fd to be closed). This
+        // shouldn't make leak detection much less reliable, since it's likely that any leak would
+        // at least leak one FD per loop.
+        final int tolerance = 4;
+        assertTrue(
+                "FD leak detected after " + iterations + " iterations: expected "
+                        + before + " +/- " + tolerance + " fds, found " + after,
+                Math.abs(after - before) <= tolerance);
     }
 
     // TODO: delete when DhcpOption is @JavaOnlyImmutable.

@@ -38,7 +38,8 @@
 #include <android/log.h>
 
 namespace android {
-constexpr const char NETWORKSTACKUTILS_PKG_NAME[] = "android/net/util/NetworkStackUtils";
+constexpr const char NETWORKSTACKUTILS_PKG_NAME[] =
+    "com/android/networkstack/util/NetworkStackUtils";
 
 static const uint32_t kEtherTypeOffset = offsetof(ether_header, ether_type);
 static const uint32_t kEtherHeaderLen = sizeof(ether_header);
@@ -126,8 +127,7 @@ static void network_stack_utils_attachDhcpFilter(JNIEnv *env, jobject clazz, job
 
     int fd = netjniutils::GetNativeFileDescriptor(env, javaFd);
     if (setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &filter, sizeof(filter)) != 0) {
-        jniThrowExceptionFmt(env, "java/net/SocketException",
-                "setsockopt(SO_ATTACH_FILTER): %s", strerror(errno));
+        jniThrowErrnoException(env, "setsockopt(SO_ATTACH_FILTER)", errno);
     }
 }
 
