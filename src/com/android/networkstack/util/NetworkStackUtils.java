@@ -17,11 +17,14 @@
 package com.android.networkstack.util;
 
 import android.content.Context;
+import android.net.LinkAddress;
 import android.net.MacAddress;
 import android.net.util.SocketUtils;
 import android.system.ErrnoException;
+import android.util.Log;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import com.android.net.module.util.DeviceConfigUtils;
 
@@ -29,7 +32,9 @@ import java.io.FileDescriptor;
 import java.io.IOException;
 import java.net.Inet4Address;
 import java.net.Inet6Address;
+import java.net.InetAddress;
 import java.net.SocketException;
+import java.net.UnknownHostException;
 
 /**
  * Collection of utilities for the network stack.
@@ -221,6 +226,13 @@ public class NetworkStackUtils {
     public static final String IPCLIENT_GRATUITOUS_NA_VERSION = "ipclient_gratuitous_na_version";
 
     /**
+     * Experiment flag to send multicast NS from the global IPv6 GUA to the solicited-node
+     * multicast address based on the default router's IPv6 link-local address, which helps
+     * flush the first-hop routers' neighbor cache entry for the global IPv6 GUA.
+     */
+    public static final String IPCLIENT_MULTICAST_NS_VERSION = "ipclient_multicast_ns_version";
+
+    /**
      * Experiment flag to enable sending Gratuitous APR and Gratuitous Neighbor Advertisement for
      * all assigned IPv4 and IPv6 GUAs after completing L2 roaming.
      */
@@ -246,6 +258,13 @@ public class NetworkStackUtils {
      */
     public static final String IP_REACHABILITY_MCAST_RESOLICIT_VERSION =
             "ip_reachability_mcast_resolicit_version";
+
+    /**
+     * Experiment flag to wait for IP addresses cleared completely before transition to
+     * IpClient#StoppedState from IpClient#StoppingState.
+     */
+    public static final String IPCLIENT_CLEAR_ADDRESSES_ON_STOP_VERSION =
+            "ipclient_clear_addresses_on_stop_version";
 
     static {
         System.loadLibrary("networkstackutilsjni");
@@ -274,6 +293,36 @@ public class NetworkStackUtils {
         etherMulticast[4] = ipv6Multicast[14];
         etherMulticast[5] = ipv6Multicast[15];
         return MacAddress.fromBytes(etherMulticast);
+    }
+
+    /**
+     * Convert IPv6 unicast or anycast address to solicited node multicast address
+     * per RFC4291 section 2.7.1.
+     */
+    @Nullable
+    public static Inet6Address ipv6AddressToSolicitedNodeMulticast(
+            @NonNull final Inet6Address addr) {
+        final byte[] address = new byte[16];
+        address[0] = (byte) 0xFF;
+        address[1] = (byte) 0x02;
+        address[11] = (byte) 0x01;
+        address[12] = (byte) 0xFF;
+        address[13] = addr.getAddress()[13];
+        address[14] = addr.getAddress()[14];
+        address[15] = addr.getAddress()[15];
+        try {
+            return (Inet6Address) InetAddress.getByAddress(address);
+        } catch (UnknownHostException e) {
+            Log.e(TAG, "Invalid host IP address " + addr.getHostAddress(), e);
+            return null;
+        }
+    }
+
+    /**
+     * Check whether a link address is IPv6 global unicast address.
+     */
+    public static boolean isIPv6GUA(@NonNull final LinkAddress address) {
+        return address.isIpv6() && address.isGlobalPreferred();
     }
 
     /**

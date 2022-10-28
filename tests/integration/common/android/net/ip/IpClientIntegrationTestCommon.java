@@ -642,6 +642,7 @@ public abstract class IpClientIntegrationTestCommon {
         when(mCb.getInterfaceVersion()).thenReturn(IpClient.VERSION_ADDED_REACHABILITY_FAILURE);
 
         mDependencies.setDeviceConfigProperty(IpClient.CONFIG_MIN_RDNSS_LIFETIME, 67);
+        mDependencies.setDeviceConfigProperty(IpClient.CONFIG_CLEAR_ADDRESSES_TIMEOUT, 50);
         mDependencies.setDeviceConfigProperty(DhcpClient.DHCP_RESTART_CONFIG_DELAY, 10);
         mDependencies.setDeviceConfigProperty(DhcpClient.ARP_FIRST_PROBE_DELAY_MS, 10);
         mDependencies.setDeviceConfigProperty(DhcpClient.ARP_PROBE_MIN_MS, 10);
@@ -2186,7 +2187,7 @@ public abstract class IpClientIntegrationTestCommon {
     }
 
     @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
-    public void testIpClientClearingIpAddressState() throws Exception {
+    public void testClearAddressesOnStartState() throws Exception {
         doIPv4OnlyProvisioningAndExitWithLeftAddress();
 
         ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
@@ -2207,7 +2208,7 @@ public abstract class IpClientIntegrationTestCommon {
     }
 
     @Test @SignatureRequiredTest(reason = "TODO: evaluate whether signature perms are required")
-    public void testIpClientClearingIpAddressState_enablePreconnection() throws Exception {
+    public void testClearAddressesOnStartState_enablePreconnection() throws Exception {
         doIPv4OnlyProvisioningAndExitWithLeftAddress();
 
         // Enter ClearingIpAddressesState to clear the remaining IPv4 addresses and transition to
@@ -2812,7 +2813,7 @@ public abstract class IpClientIntegrationTestCommon {
                 true /* shouldReplyNakOnRoam */);
     }
 
-    private void performDualStackProvisioning() throws Exception {
+    private LinkProperties performDualStackProvisioning() throws Exception {
         final InOrder inOrder = inOrder(mCb);
         final CompletableFuture<LinkProperties> lpFuture = new CompletableFuture<>();
         final String dnsServer = "2001:4860:4860::64";
@@ -2838,9 +2839,10 @@ public abstract class IpClientIntegrationTestCommon {
         assertTrue(lp.getDnsServers().contains(SERVER_ADDR));
 
         reset(mCb);
+        return lp;
     }
 
-    private void doDualStackProvisioning(boolean shouldDisableAcceptRa) throws Exception {
+    private LinkProperties doDualStackProvisioning(boolean shouldDisableAcceptRa) throws Exception {
         when(mCm.shouldAvoidBadWifi()).thenReturn(true);
 
         final ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
@@ -2855,7 +2857,7 @@ public abstract class IpClientIntegrationTestCommon {
                 false /* isDhcpIpConflictDetectEnabled */, false /* isIPv6OnlyPreferredEnabled */);
         mIpc.startProvisioning(config);
 
-        performDualStackProvisioning();
+        return performDualStackProvisioning();
     }
 
     @Test @SignatureRequiredTest(reason = "signature perms are required due to mocked callabck")
@@ -3497,6 +3499,25 @@ public abstract class IpClientIntegrationTestCommon {
         assertTrue(target.isGlobalPreferred());
     }
 
+    private void assertMulticastNsFromIpv6Gua(final NeighborSolicitation ns) throws Exception {
+        final Inet6Address solicitedNodeMulticast =
+                NetworkStackUtils.ipv6AddressToSolicitedNodeMulticast(ROUTER_LINK_LOCAL);
+        final MacAddress etherMulticast =
+                NetworkStackUtils.ipv6MulticastToEthernetMulticast(solicitedNodeMulticast);
+
+        assertEquals(etherMulticast, ns.ethHdr.dstMac);
+        assertEquals(ETH_P_IPV6, ns.ethHdr.etherType);
+        assertEquals(IPPROTO_ICMPV6, ns.ipv6Hdr.nextHeader);
+        assertEquals(0xff, ns.ipv6Hdr.hopLimit);
+
+        final LinkAddress srcIp = new LinkAddress(ns.ipv6Hdr.srcIp.getHostAddress() + "/64");
+        assertTrue(srcIp.isGlobalPreferred());
+        assertEquals(solicitedNodeMulticast, ns.ipv6Hdr.dstIp);
+        assertEquals(ICMPV6_NEIGHBOR_SOLICITATION, ns.icmpv6Hdr.type);
+        assertEquals(0, ns.icmpv6Hdr.code);
+        assertEquals(ROUTER_LINK_LOCAL, ns.nsHdr.target);
+    }
+
     @Test
     public void testGratuitousNaForNewGlobalUnicastAddresses() throws Exception {
         final ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
@@ -4002,5 +4023,53 @@ public abstract class IpClientIntegrationTestCommon {
         assertNotNull(lp);
         assertFalse(hasRouteTo(lp, prefix));
         assertFalse(lp.hasIpv6DefaultRoute());
+    }
+
+    @Test @SignatureRequiredTest(reason = "Need MANAGE_TEST_NETWORKS perm to create NetworkAgent")
+    public void testClearAddressesOnStopState() throws Exception {
+        setFeatureEnabled(NetworkStackUtils.IPCLIENT_CLEAR_ADDRESSES_ON_STOP_VERSION, true);
+        mNetworkAgentThread =
+                new HandlerThread(IpClientIntegrationTestCommon.class.getSimpleName());
+        mNetworkAgentThread.start();
+
+        final LinkProperties lp = doDualStackProvisioning(false /* shouldDisableAcceptRa */);
+        runAsShell(MANAGE_TEST_NETWORKS, () -> createTestNetworkAgentAndRegister(lp));
+
+        // Verify the link addresses and IPv6 routes get removed before transition to StoppedState..
+        mNetworkAgent.unregister();
+        mNetworkAgentThread.quitSafely();
+        mIIpClient.shutdown();
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).onLinkPropertiesChange(argThat(
+                x -> x.getAddresses().size() == 0
+                        && !x.hasIpv6DefaultRoute()
+                        && x.getDnsServers().size() == 0));
+        awaitIpClientShutdown();
+    }
+
+    @Test
+    public void testMulticastNsFromIPv6Gua() throws Exception {
+        final ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
+                .withoutIpReachabilityMonitor()
+                .withoutIPv4()
+                .build();
+
+        setFeatureEnabled(NetworkStackUtils.IPCLIENT_MULTICAST_NS_VERSION,
+                true /* isUnsolicitedNsEnabled */);
+        assertTrue(isFeatureEnabled(NetworkStackUtils.IPCLIENT_MULTICAST_NS_VERSION, false));
+        startIpClientProvisioning(config);
+
+        doIpv6OnlyProvisioning();
+
+        final List<NeighborSolicitation> nsList = new ArrayList<>();
+        NeighborSolicitation packet;
+        while ((packet = getNextNeighborSolicitation()) != null) {
+            // Filter out the NSes used for duplicate address detetction, whose target address
+            // is the global IPv6 address inside these NSes.
+            if (packet.nsHdr.target.isLinkLocalAddress()) {
+                assertMulticastNsFromIpv6Gua(packet);
+                nsList.add(packet);
+            }
+        }
+        assertEquals(2, nsList.size()); // from privacy address and stable privacy address
     }
 }

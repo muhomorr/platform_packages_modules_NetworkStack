@@ -60,6 +60,7 @@ import com.android.net.module.util.netlink.StructNdOptPref64;
 import com.android.net.module.util.netlink.StructNdOptRdnss;
 import com.android.networkstack.apishim.NetworkInformationShimImpl;
 import com.android.networkstack.apishim.common.NetworkInformationShim;
+import com.android.networkstack.util.NetworkStackUtils;
 import com.android.server.NetworkObserver;
 
 import java.net.Inet6Address;
@@ -120,7 +121,7 @@ public class IpClientLinkObserver implements NetworkObserver {
         void update(boolean linkState);
 
         /**
-         * Called when an IPv6 address was removed from the interface.
+         * Called when an IPv6 global unicast address was removed from the interface.
          *
          * @param addr The removed IPv6 address.
          */
@@ -156,6 +157,7 @@ public class IpClientLinkObserver implements NetworkObserver {
     private final IpClient.Dependencies mDependencies;
     private final String mClatInterfaceName;
     private final MyNetlinkMonitor mNetlinkMonitor;
+    private final boolean mNetlinkEventParsingEnabled;
 
     private boolean mClatInterfaceExists;
 
@@ -176,7 +178,7 @@ public class IpClientLinkObserver implements NetworkObserver {
         mContext = context;
         mInterfaceName = iface;
         mClatInterfaceName = CLAT_PREFIX + iface;
-        mTag = "NetlinkTracker/" + mInterfaceName;
+        mTag = "IpClientLinkObserver/" + mInterfaceName;
         mCallback = callback;
         mLinkProperties = new LinkProperties();
         mLinkProperties.setInterfaceName(mInterfaceName);
@@ -186,6 +188,8 @@ public class IpClientLinkObserver implements NetworkObserver {
         mDnsServerRepository = new DnsServerRepository(config.minRdnssLifetime);
         mAlarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
         mDependencies = deps;
+        mNetlinkEventParsingEnabled = deps.isFeatureEnabled(context,
+                IPCLIENT_PARSE_NETLINK_EVENTS_VERSION, isAtLeastT() /* default value */);
         mNetlinkMonitor = new MyNetlinkMonitor(h, log, mTag);
         mHandler.post(() -> {
             if (!mNetlinkMonitor.start()) {
@@ -215,11 +219,6 @@ public class IpClientLinkObserver implements NetworkObserver {
         }
     }
 
-    private boolean isNetlinkEventParsingEnabled() {
-        return mDependencies.isFeatureEnabled(mContext, IPCLIENT_PARSE_NETLINK_EVENTS_VERSION,
-                isAtLeastT() /* default value */);
-    }
-
     private int getSocketReceiveBufferSize() {
         final int size = mDependencies.getDeviceConfigPropertyInt(CONFIG_SOCKET_RECV_BUFSIZE,
                 SOCKET_RECV_BUFSIZE /* default value */);
@@ -231,7 +230,7 @@ public class IpClientLinkObserver implements NetworkObserver {
 
     @Override
     public void onInterfaceAdded(String iface) {
-        if (isNetlinkEventParsingEnabled()) return;
+        if (mNetlinkEventParsingEnabled) return;
         maybeLog("interfaceAdded", iface);
         if (mClatInterfaceName.equals(iface)) {
             mCallback.onClatInterfaceStateUpdate(true /* add interface */);
@@ -240,7 +239,7 @@ public class IpClientLinkObserver implements NetworkObserver {
 
     @Override
     public void onInterfaceRemoved(String iface) {
-        if (isNetlinkEventParsingEnabled()) return;
+        if (mNetlinkEventParsingEnabled) return;
         maybeLog("interfaceRemoved", iface);
         if (mClatInterfaceName.equals(iface)) {
             mCallback.onClatInterfaceStateUpdate(false /* remove interface */);
@@ -251,7 +250,7 @@ public class IpClientLinkObserver implements NetworkObserver {
 
     @Override
     public void onInterfaceLinkStateChanged(String iface, boolean state) {
-        if (isNetlinkEventParsingEnabled()) return;
+        if (mNetlinkEventParsingEnabled) return;
         if (!mInterfaceName.equals(iface)) return;
         maybeLog("interfaceLinkStateChanged", iface + (state ? " up" : " down"));
         updateInterfaceLinkStateChanged(state);
@@ -259,7 +258,7 @@ public class IpClientLinkObserver implements NetworkObserver {
 
     @Override
     public void onInterfaceAddressUpdated(LinkAddress address, String iface) {
-        if (isNetlinkEventParsingEnabled()) return;
+        if (mNetlinkEventParsingEnabled) return;
         if (!mInterfaceName.equals(iface)) return;
         maybeLog("addressUpdated", iface, address);
         updateInterfaceAddress(address, true /* add address */);
@@ -267,7 +266,7 @@ public class IpClientLinkObserver implements NetworkObserver {
 
     @Override
     public void onInterfaceAddressRemoved(LinkAddress address, String iface) {
-        if (isNetlinkEventParsingEnabled()) return;
+        if (mNetlinkEventParsingEnabled) return;
         if (!mInterfaceName.equals(iface)) return;
         maybeLog("addressRemoved", iface, address);
         updateInterfaceAddress(address, false /* remove address */);
@@ -275,7 +274,7 @@ public class IpClientLinkObserver implements NetworkObserver {
 
     @Override
     public void onRouteUpdated(RouteInfo route) {
-        if (isNetlinkEventParsingEnabled()) return;
+        if (mNetlinkEventParsingEnabled) return;
         if (!mInterfaceName.equals(route.getInterface())) return;
         maybeLog("routeUpdated", route);
         updateInterfaceRoute(route, true /* add route */);
@@ -283,7 +282,7 @@ public class IpClientLinkObserver implements NetworkObserver {
 
     @Override
     public void onRouteRemoved(RouteInfo route) {
-        if (isNetlinkEventParsingEnabled()) return;
+        if (mNetlinkEventParsingEnabled) return;
         if (!mInterfaceName.equals(route.getInterface())) return;
         maybeLog("routeRemoved", route);
         updateInterfaceRoute(route, false /* remove route */);
@@ -291,7 +290,7 @@ public class IpClientLinkObserver implements NetworkObserver {
 
     @Override
     public void onInterfaceDnsServerInfo(String iface, long lifetime, String[] addresses) {
-        if (isNetlinkEventParsingEnabled()) return;
+        if (mNetlinkEventParsingEnabled) return;
         if (!mInterfaceName.equals(iface)) return;
         updateInterfaceDnsServerInfo(lifetime, addresses);
     }
@@ -326,7 +325,7 @@ public class IpClientLinkObserver implements NetworkObserver {
         }
         if (changed) {
             mCallback.update(linkState);
-            if (!add && address.isIpv6()) {
+            if (!add && NetworkStackUtils.isIPv6GUA(address)) {
                 final Inet6Address addr = (Inet6Address) address.getAddress();
                 mCallback.onIpv6AddressRemoved(addr);
             }
@@ -423,7 +422,7 @@ public class IpClientLinkObserver implements NetworkObserver {
 
         MyNetlinkMonitor(Handler h, SharedLog log, String tag) {
             super(h, log, tag, OsConstants.NETLINK_ROUTE,
-                    !isNetlinkEventParsingEnabled()
+                    !mNetlinkEventParsingEnabled
                         ? NetlinkConstants.RTMGRP_ND_USEROPT
                         : (NetlinkConstants.RTMGRP_ND_USEROPT | NetlinkConstants.RTMGRP_LINK
                                 | NetlinkConstants.RTMGRP_IPV4_IFADDR
@@ -536,7 +535,7 @@ public class IpClientLinkObserver implements NetworkObserver {
         }
 
         private void processRdnssOption(StructNdOptRdnss opt) {
-            if (!isNetlinkEventParsingEnabled()) return;
+            if (!mNetlinkEventParsingEnabled) return;
             final String[] addresses = new String[opt.servers.length];
             for (int i = 0; i < opt.servers.length; i++) {
                 addresses[i] = opt.servers[i].getHostAddress();
@@ -587,7 +586,7 @@ public class IpClientLinkObserver implements NetworkObserver {
         }
 
         private void processRtNetlinkLinkMessage(RtNetlinkLinkMessage msg) {
-            if (!isNetlinkEventParsingEnabled()) return;
+            if (!mNetlinkEventParsingEnabled) return;
 
             // Check if receiving netlink link state update for clat interface.
             final String ifname = msg.getInterfaceName();
@@ -621,7 +620,7 @@ public class IpClientLinkObserver implements NetworkObserver {
         }
 
         private void processRtNetlinkAddressMessage(RtNetlinkAddressMessage msg) {
-            if (!isNetlinkEventParsingEnabled()) return;
+            if (!mNetlinkEventParsingEnabled) return;
 
             final StructIfaddrMsg ifaddrMsg = msg.getIfaddrHeader();
             if (ifaddrMsg.index != mIfindex) return;
@@ -646,7 +645,7 @@ public class IpClientLinkObserver implements NetworkObserver {
         }
 
         private void processRtNetlinkRouteMessage(RtNetlinkRouteMessage msg) {
-            if (!isNetlinkEventParsingEnabled()) return;
+            if (!mNetlinkEventParsingEnabled) return;
             if (msg.getInterfaceIndex() != mIfindex) return;
             // Ignore the unsupported route protocol and non-global unicast routes.
             if (!isSupportedRouteProtocol(msg)

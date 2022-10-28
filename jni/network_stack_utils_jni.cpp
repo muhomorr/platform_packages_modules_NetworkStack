@@ -60,7 +60,7 @@ static bool checkLenAndCopy(JNIEnv* env, const jbyteArray& addr, int len, void* 
     return true;
 }
 
-static void network_stack_utils_addArpEntry(JNIEnv *env, jobject thiz, jbyteArray ethAddr,
+static void network_stack_utils_addArpEntry(JNIEnv *env, jclass clazz, jbyteArray ethAddr,
         jbyteArray ipv4Addr, jstring ifname, jobject javaFd) {
     arpreq req = {};
     sockaddr_in& netAddrStruct = *reinterpret_cast<sockaddr_in*>(&req.arp_pa);
@@ -99,7 +99,7 @@ static void network_stack_utils_addArpEntry(JNIEnv *env, jobject thiz, jbyteArra
     }
 }
 
-static void network_stack_utils_attachDhcpFilter(JNIEnv *env, jobject clazz, jobject javaFd) {
+static void network_stack_utils_attachDhcpFilter(JNIEnv *env, jclass clazz, jobject javaFd) {
     static sock_filter filter_code[] = {
         // Check the protocol is UDP.
         BPF_STMT(BPF_LD  | BPF_B    | BPF_ABS, kIPv4Protocol),
@@ -107,7 +107,7 @@ static void network_stack_utils_attachDhcpFilter(JNIEnv *env, jobject clazz, job
 
         // Check this is not a fragment.
         BPF_STMT(BPF_LD  | BPF_H    | BPF_ABS, kIPv4FlagsOffset),
-        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K,   IP_OFFMASK, 4, 0),
+        BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K,   IP_MF | IP_OFFMASK, 4, 0),
 
         // Get the IP header length.
         BPF_STMT(BPF_LDX | BPF_B    | BPF_MSH, kEtherHeaderLen),
@@ -116,8 +116,10 @@ static void network_stack_utils_attachDhcpFilter(JNIEnv *env, jobject clazz, job
         BPF_STMT(BPF_LD  | BPF_H    | BPF_IND, kUDPDstPortIndirectOffset),
         BPF_JUMP(BPF_JMP | BPF_JEQ  | BPF_K,   kDhcpClientPort, 0, 1),
 
-        // Accept or reject.
+        // Accept.
         BPF_STMT(BPF_RET | BPF_K,              0xffff),
+
+        // Reject.
         BPF_STMT(BPF_RET | BPF_K,              0)
     };
     static const sock_fprog filter = {
@@ -131,7 +133,7 @@ static void network_stack_utils_attachDhcpFilter(JNIEnv *env, jobject clazz, job
     }
 }
 
-static void network_stack_utils_attachRaFilter(JNIEnv *env, jobject clazz, jobject javaFd,
+static void network_stack_utils_attachRaFilter(JNIEnv *env, jclass clazz, jobject javaFd,
         jint hardwareAddressType) {
     if (hardwareAddressType != ARPHRD_ETHER) {
         jniThrowExceptionFmt(env, "java/net/SocketException",
@@ -148,8 +150,10 @@ static void network_stack_utils_attachRaFilter(JNIEnv *env, jobject clazz, jobje
         BPF_STMT(BPF_LD  | BPF_B   | BPF_ABS,  kICMPv6TypeOffset),
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,    ND_ROUTER_ADVERT, 0, 1),
 
-        // Accept or reject.
+        // Accept.
         BPF_STMT(BPF_RET | BPF_K,              0xffff),
+
+        // Reject.
         BPF_STMT(BPF_RET | BPF_K,              0)
     };
     static const sock_fprog filter = {
@@ -166,7 +170,7 @@ static void network_stack_utils_attachRaFilter(JNIEnv *env, jobject clazz, jobje
 
 // TODO: Move all this filter code into libnetutils.
 static void network_stack_utils_attachControlPacketFilter(
-        JNIEnv *env, jobject clazz, jobject javaFd, jint hardwareAddressType) {
+        JNIEnv *env, jclass clazz, jobject javaFd, jint hardwareAddressType) {
     if (hardwareAddressType != ARPHRD_ETHER) {
         jniThrowExceptionFmt(env, "java/net/SocketException",
                 "attachControlPacketFilter only supports ARPHRD_ETHER");
@@ -223,8 +227,10 @@ static void network_stack_utils_attachControlPacketFilter(
         BPF_JUMP(BPF_JMP | BPF_JGE  | BPF_K,   ND_ROUTER_SOLICIT, 0, 2),
         BPF_JUMP(BPF_JMP | BPF_JGT  | BPF_K,   ND_NEIGHBOR_ADVERT, 1, 0),
 
-        // Accept or reject.
+        // Accept.
         BPF_STMT(BPF_RET | BPF_K,              0xffff),
+
+        // Reject.
         BPF_STMT(BPF_RET | BPF_K,              0)
     };
     static const sock_fprog filter = {

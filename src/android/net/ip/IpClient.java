@@ -35,9 +35,11 @@ import static com.android.net.module.util.NetworkStackConstants.ARP_REPLY;
 import static com.android.net.module.util.NetworkStackConstants.ETHER_BROADCAST;
 import static com.android.net.module.util.NetworkStackConstants.IPV6_ADDR_ALL_ROUTERS_MULTICAST;
 import static com.android.net.module.util.NetworkStackConstants.VENDOR_SPECIFIC_IE_ID;
+import static com.android.networkstack.util.NetworkStackUtils.IPCLIENT_CLEAR_ADDRESSES_ON_STOP_VERSION;
 import static com.android.networkstack.util.NetworkStackUtils.IPCLIENT_DISABLE_ACCEPT_RA_VERSION;
 import static com.android.networkstack.util.NetworkStackUtils.IPCLIENT_GARP_NA_ROAMING_VERSION;
 import static com.android.networkstack.util.NetworkStackUtils.IPCLIENT_GRATUITOUS_NA_VERSION;
+import static com.android.networkstack.util.NetworkStackUtils.IPCLIENT_MULTICAST_NS_VERSION;
 import static com.android.server.util.PermissionUtil.enforceNetworkStackCallingPermission;
 
 import android.annotation.SuppressLint;
@@ -116,6 +118,7 @@ import com.android.networkstack.arp.ArpPacket;
 import com.android.networkstack.metrics.IpProvisioningMetrics;
 import com.android.networkstack.metrics.NetworkQuirkMetrics;
 import com.android.networkstack.packets.NeighborAdvertisement;
+import com.android.networkstack.packets.NeighborSolicitation;
 import com.android.networkstack.util.NetworkStackUtils;
 import com.android.server.NetworkObserverRegistry;
 import com.android.server.NetworkStackService.NetworkStackServiceManager;
@@ -455,7 +458,7 @@ public class IpClient extends StateMachine {
     private static final int CMD_START                            = 3;
     private static final int CMD_CONFIRM                          = 4;
     private static final int EVENT_PRE_DHCP_ACTION_COMPLETE       = 5;
-    // Triggered by NetlinkTracker to communicate netlink events.
+    // Triggered by IpClientLinkObserver to communicate netlink events.
     private static final int EVENT_NETLINK_LINKPROPERTIES_CHANGED = 6;
     private static final int CMD_UPDATE_TCP_BUFFER_SIZES          = 7;
     private static final int CMD_UPDATE_HTTP_PROXY                = 8;
@@ -478,6 +481,16 @@ public class IpClient extends StateMachine {
     private static final int CMD_ADDRESSES_CLEARED                = 100;
     private static final int CMD_JUMP_RUNNING_TO_STOPPING         = 101;
     private static final int CMD_JUMP_STOPPING_TO_STOPPED         = 102;
+    private static final int CMD_JUMP_STOPPING_TO_CLEAR_ADDRESSES_ON_STOP = 103;
+    private static final int EVENT_CLEAR_ADDRESSES_TIMEOUT        = 104;
+
+    // Used to time out the wait for IP addresses cleared. This timeout is
+    // necessary because netlink events will get lost if ENOBUFS happens,
+    // then RTM_DELADDR might never arrive, which results in never exiting
+    // ClearAddressesOnStopState.
+    @VisibleForTesting
+    static final String CONFIG_CLEAR_ADDRESSES_TIMEOUT = "ipclient_clear_addresses_timeout";
+    private static final int DEFAULT_CLEAR_ADDRESSES_TIMEOUT_MS = 2000;
 
     // IpClient shares a handler with DhcpClient: commands must not overlap
     public static final int DHCPCLIENT_CMD_BASE = 1000;
@@ -532,10 +545,11 @@ public class IpClient extends StateMachine {
 
     private final State mStoppedState = new StoppedState();
     private final State mStoppingState = new StoppingState();
-    private final State mClearingIpAddressesState = new ClearingIpAddressesState();
     private final State mStartedState = new StartedState();
     private final State mRunningState = new RunningState();
     private final State mPreconnectingState = new PreconnectingState();
+    private final State mClearAddressesOnStopState = new ClearAddressesOnStopState();
+    private final State mClearAddressesOnStartState = new ClearAddressesOnStartState();
 
     private final String mTag;
     private final Context mContext;
@@ -557,6 +571,8 @@ public class IpClient extends StateMachine {
     private final InterfaceController mInterfaceCtrl;
     // Set of IPv6 addresses for which unsolicited gratuitous NA packets have been sent.
     private final Set<Inet6Address> mGratuitousNaTargetAddresses = new HashSet<>();
+    // Set of IPv6 addresses from which multicast NS packets have been sent.
+    private final Set<Inet6Address> mMulticastNsSourceAddresses = new HashSet<>();
 
     // Ignore nonzero RDNSS option lifetimes below this value. 0 = disabled.
     private final int mMinRdnssLifetimeSec;
@@ -580,6 +596,7 @@ public class IpClient extends StateMachine {
     private long mStartTimeMillis;
     private MacAddress mCurrentBssid;
     private boolean mHasDisabledIpv6OrAcceptRaOnProvLoss;
+    private boolean mClearAddressesOnStop;
 
     /**
      * Reading the snapshot is an asynchronous operation initiated by invoking
@@ -745,15 +762,18 @@ public class IpClient extends StateMachine {
                     }
 
                     @Override
-                    public void onIpv6AddressRemoved(final Inet6Address targetIp) {
-                        // The update of Gratuitous NA target addresses set should be only accessed
-                        // from the handler thread of IpClient StateMachine, keeping the behaviour
+                    public void onIpv6AddressRemoved(final Inet6Address address) {
+                        // The update of Gratuitous NA target addresses set or unsolicited
+                        // multicast NS source addresses set should be only accessed from the
+                        // handler thread of IpClient StateMachine, keeping the behaviour
                         // consistent with relying on the non-blocking NetworkObserver callbacks,
                         // see {@link registerObserverForNonblockingCallback}. This can be done
                         // by either sending a message to StateMachine or posting a handler.
                         getHandler().post(() -> {
-                            if (!mGratuitousNaTargetAddresses.contains(targetIp)) return;
-                            updateGratuitousNaTargetSet(targetIp, false /* remove address */);
+                            mLog.log("Remove IPv6 GUA " + address
+                                    + " from both Gratuituous NA and Multicast NS sets");
+                            mGratuitousNaTargetAddresses.remove(address);
+                            mMulticastNsSourceAddresses.remove(address);
                         });
                     }
 
@@ -891,10 +911,11 @@ public class IpClient extends StateMachine {
         // CHECKSTYLE:OFF IndentationCheck
         addState(mStoppedState);
         addState(mStartedState);
+            addState(mClearAddressesOnStartState, mStartedState);
             addState(mPreconnectingState, mStartedState);
-            addState(mClearingIpAddressesState, mStartedState);
             addState(mRunningState, mStartedState);
         addState(mStoppingState);
+        addState(mClearAddressesOnStopState);
         // CHECKSTYLE:ON IndentationCheck
 
         setInitialState(mStoppedState);
@@ -919,6 +940,11 @@ public class IpClient extends StateMachine {
 
     private boolean isGratuitousArpNaRoamingEnabled() {
         return mDependencies.isFeatureEnabled(mContext, IPCLIENT_GARP_NA_ROAMING_VERSION,
+                false /* defaultEnabled */);
+    }
+
+    private boolean isMulticastNsEnabled() {
+        return mDependencies.isFeatureEnabled(mContext, IPCLIENT_MULTICAST_NS_VERSION,
                 false /* defaultEnabled */);
     }
 
@@ -949,6 +975,11 @@ public class IpClient extends StateMachine {
     private boolean shouldDisableAcceptRaOnProvisioningLoss() {
         return mDependencies.isFeatureEnabled(mContext, IPCLIENT_DISABLE_ACCEPT_RA_VERSION,
                 true /* defaultEnabled */);
+    }
+
+    private boolean shouldClearAddressesOnStop() {
+        return mDependencies.isFeatureEnabled(mContext, IPCLIENT_CLEAR_ADDRESSES_ON_STOP_VERSION,
+                false /* defaultEnabled */);
     }
 
     @Override
@@ -1636,6 +1667,22 @@ public class IpClient extends StateMachine {
         transmitPacket(packet, sockAddress, "Failed to send GARP");
     }
 
+    private void sendMulticastNs(final Inet6Address srcIp, final Inet6Address dstIp,
+            final Inet6Address targetIp) {
+        final MacAddress dstMac = NetworkStackUtils.ipv6MulticastToEthernetMulticast(dstIp);
+        final ByteBuffer packet = NeighborSolicitation.build(mInterfaceParams.macAddr, dstMac,
+                srcIp, dstIp, targetIp);
+        final SocketAddress sockAddress =
+                SocketUtilsShimImpl.newInstance().makePacketSocketAddress(ETH_P_IPV6,
+                        mInterfaceParams.index, dstMac.toByteArray());
+
+        if (DBG) {
+            mLog.log("send multicast NS from " + srcIp.getHostAddress() + " to "
+                    + dstIp.getHostAddress() + " , target IP: " + targetIp.getHostAddress());
+        }
+        transmitPacket(packet, sockAddress, "Failed to send multicast Neighbor Solicitation");
+    }
+
     @Nullable
     private static Inet6Address getIpv6LinkLocalAddress(final LinkProperties newLp) {
         for (LinkAddress la : newLp.getLinkAddresses()) {
@@ -1644,16 +1691,6 @@ public class IpClient extends StateMachine {
             if (ip.isLinkLocalAddress()) return ip;
         }
         return null;
-    }
-
-    private void updateGratuitousNaTargetSet(@NonNull final Inet6Address targetIp, boolean add) {
-        if (add) {
-            mGratuitousNaTargetAddresses.add(targetIp);
-        } else {
-            mGratuitousNaTargetAddresses.remove(targetIp);
-        }
-        mLog.log((add ? "Add" : "Remove") + " global IPv6 address " + targetIp
-                + (add ? " to" : " from") + " the set of gratuitous NA target address.");
     }
 
     private void maybeSendGratuitousNAs(final LinkProperties lp, boolean afterRoaming) {
@@ -1665,7 +1702,7 @@ public class IpClient extends StateMachine {
         // TODO: add experiment with sending only one gratuitous NA packet instead of one
         // packet per address.
         for (LinkAddress la : lp.getLinkAddresses()) {
-            if (!la.isIpv6() || !la.isGlobalPreferred()) continue;
+            if (!NetworkStackUtils.isIPv6GUA(la)) continue;
             final Inet6Address targetIp = (Inet6Address) la.getAddress();
             // Already sent gratuitous NA with this target global IPv6 address. But for
             // the L2 roaming case, device should always (re)transmit Gratuitous NA for
@@ -1676,7 +1713,9 @@ public class IpClient extends StateMachine {
                         + targetIp.getHostAddress() + (afterRoaming ? " after roaming" : ""));
             }
             sendGratuitousNA(srcIp, targetIp);
-            if (!afterRoaming) updateGratuitousNaTargetSet(targetIp, true /* add address */);
+            if (!afterRoaming) {
+                mGratuitousNaTargetAddresses.add(targetIp);
+            }
         }
     }
 
@@ -1693,6 +1732,39 @@ public class IpClient extends StateMachine {
         }
     }
 
+    @Nullable
+    private static Inet6Address getIPv6DefaultGateway(final LinkProperties lp) {
+        for (RouteInfo r : lp.getRoutes()) {
+            // TODO: call {@link RouteInfo#isIPv6Default} directly after core networking modules
+            // are consolidated.
+            if (r.getType() == RTN_UNICAST && r.getDestination().getPrefixLength() == 0
+                    && r.getDestination().getAddress() instanceof Inet6Address) {
+                // Check if it's IPv6 default route, if yes, return the gateway address
+                // (i.e. default router's IPv6 link-local address)
+                return (Inet6Address) r.getGateway();
+            }
+        }
+        return null;
+    }
+
+    private void maybeSendMulticastNSes(final LinkProperties lp) {
+        if (!(lp.hasGlobalIpv6Address() && lp.hasIpv6DefaultRoute())) return;
+
+        // Get the default router's IPv6 link-local address.
+        final Inet6Address targetIp = getIPv6DefaultGateway(lp);
+        if (targetIp == null) return;
+        final Inet6Address dstIp = NetworkStackUtils.ipv6AddressToSolicitedNodeMulticast(targetIp);
+        if (dstIp == null) return;
+
+        for (LinkAddress la : lp.getLinkAddresses()) {
+            if (!NetworkStackUtils.isIPv6GUA(la)) continue;
+            final Inet6Address srcIp = (Inet6Address) la.getAddress();
+            if (mMulticastNsSourceAddresses.contains(srcIp)) continue;
+            sendMulticastNs(srcIp, dstIp, targetIp);
+            mMulticastNsSourceAddresses.add(srcIp);
+        }
+    }
+
     // Returns false if we have lost provisioning, true otherwise.
     private boolean handleLinkPropertiesUpdate(boolean sendCallbacks) {
         final LinkProperties newLp = assembleLinkProperties();
@@ -1705,6 +1777,17 @@ public class IpClient extends StateMachine {
         // first-hop routers that the new GUA host is goning to use.
         if (isGratuitousNaEnabled()) {
             maybeSendGratuitousNAs(newLp, false /* isGratuitousNaAfterRoaming */);
+        }
+
+        // Sending multicast NS from each new assigned IPv6 GUAs to the solicited-node multicast
+        // address based on the default router's IPv6 link-local address should trigger default
+        // router response with NA, and update the neighbor cache entry immediately, that would
+        // help speed up the connection to an IPv6-only network.
+        //
+        // TODO: stop sending this multicast NS after deployment of RFC9131 in the field, leverage
+        // the gratuitous NA to update the first-hop router's neighbor cache entry.
+        if (isMulticastNsEnabled()) {
+            maybeSendMulticastNSes(newLp);
         }
 
         // Either success IPv4 or IPv6 provisioning triggers new LinkProperties update,
@@ -2004,9 +2087,15 @@ public class IpClient extends StateMachine {
     class StoppedState extends State {
         @Override
         public void enter() {
+            // It's necessary to disable IPv6 stack at StoppedState#enter, which cleans up the
+            // IPv6 link-local address and default IPv6 link-local route(fe80::/64 -> ::) which
+            // are generated on interface creation. The IPv6 link-local address and route will
+            // come back later during provisioning, otherwise, there is no way to syncup the
+            // initial link-local address and route to mLinkProperties.
             stopAllIP();
             mHasDisabledIpv6OrAcceptRaOnProvLoss = false;
             mGratuitousNaTargetAddresses.clear();
+            mMulticastNsSourceAddresses.clear();
 
             resetLinkProperties();
             if (mStartTimeMillis > 0) {
@@ -2030,8 +2119,9 @@ public class IpClient extends StateMachine {
                     break;
 
                 case CMD_START:
+                    mClearAddressesOnStop = shouldClearAddressesOnStop();
                     mConfiguration = (android.net.shared.ProvisioningConfiguration) msg.obj;
-                    transitionTo(mClearingIpAddressesState);
+                    transitionTo(mClearAddressesOnStartState);
                     break;
 
                 case EVENT_NETLINK_LINKPROPERTIES_CHANGED:
@@ -2078,7 +2168,10 @@ public class IpClient extends StateMachine {
         public void enter() {
             if (mDhcpClient == null) {
                 // There's no DHCPv4 for which to wait; proceed to stopped.
-                deferMessage(obtainMessage(CMD_JUMP_STOPPING_TO_STOPPED));
+                deferMessage(obtainMessage(
+                        mClearAddressesOnStop
+                                ? CMD_JUMP_STOPPING_TO_CLEAR_ADDRESSES_ON_STOP
+                                : CMD_JUMP_STOPPING_TO_STOPPED));
             } else {
                 mDhcpClient.sendMessage(DhcpClient.CMD_STOP_DHCP);
                 mDhcpClient.doQuit();
@@ -2095,6 +2188,10 @@ public class IpClient extends StateMachine {
                     transitionTo(mStoppedState);
                     break;
 
+                case CMD_JUMP_STOPPING_TO_CLEAR_ADDRESSES_ON_STOP:
+                    transitionTo(mClearAddressesOnStopState);
+                    break;
+
                 case CMD_STOP:
                     break;
 
@@ -2104,7 +2201,9 @@ public class IpClient extends StateMachine {
 
                 case DhcpClient.CMD_ON_QUIT:
                     mDhcpClient = null;
-                    transitionTo(mStoppedState);
+                    transitionTo(mClearAddressesOnStop
+                            ? mClearAddressesOnStopState
+                            : mStoppedState);
                     break;
 
                 default:
@@ -2160,7 +2259,65 @@ public class IpClient extends StateMachine {
                 isUsingPreconnection(), options));
     }
 
-    class ClearingIpAddressesState extends State {
+    abstract class ClearAddressesState extends State {
+        protected abstract State getTargetState();
+
+        @Override
+        public boolean processMessage(Message msg) {
+            switch (msg.what) {
+                case CMD_ADDRESSES_CLEARED:
+                    transitionTo(getTargetState());
+                    break;
+
+                case EVENT_NETLINK_LINKPROPERTIES_CHANGED:
+                    handleLinkPropertiesUpdate(NO_CALLBACKS);
+                    if (readyToProceed()) {
+                        transitionTo(getTargetState());
+                    }
+                    break;
+
+                case EVENT_CLEAR_ADDRESSES_TIMEOUT:
+                    transitionTo(mStoppedState);
+                    break;
+
+                default:
+                    return NOT_HANDLED;
+            }
+            return HANDLED;
+        }
+
+        // Usually NetworkAgent will be unregistered along with stopping IpClient, then network will
+        // be destroyed and IPv6 relevant routes will be removed from interface, but IPv4 relevant
+        // routes won't be removed if any. Disabling IPv6 stack also results in the removal of all
+        // IPv6 addresses and relevant routes.
+        private boolean readyToProceed() {
+            return !mLinkProperties.hasIpv4Address() && !mLinkProperties.hasGlobalIpv6Address()
+                    && !mLinkProperties.hasIpv6DefaultRoute();
+        }
+
+        protected void ensureIpAddressesCleared() {
+            if (readyToProceed()) {
+                deferMessage(obtainMessage(CMD_ADDRESSES_CLEARED));
+            } else {
+                // Clear all IPv4 and IPv6 before proceeding to RunningState.
+                // Clean up any leftover state from an abnormal exit from
+                // tethering or during an IpClient restart.
+                stopAllIP();
+
+                // Set a timeout for waiting the RTM_DELADDR netlink events.
+                sendMessageDelayed(EVENT_CLEAR_ADDRESSES_TIMEOUT,
+                        mDependencies.getDeviceConfigPropertyInt(CONFIG_CLEAR_ADDRESSES_TIMEOUT,
+                                DEFAULT_CLEAR_ADDRESSES_TIMEOUT_MS));
+            }
+        }
+    }
+
+    class ClearAddressesOnStartState extends ClearAddressesState {
+        @Override
+        protected State getTargetState() {
+            return isUsingPreconnection() ? mPreconnectingState : mRunningState;
+        }
+
         @Override
         public void enter() {
             // Ensure that interface parameters are fetched on the handler thread so they are
@@ -2175,33 +2332,14 @@ public class IpClient extends StateMachine {
             }
 
             mLinkObserver.setInterfaceParams(mInterfaceParams);
-
-            if (readyToProceed()) {
-                deferMessage(obtainMessage(CMD_ADDRESSES_CLEARED));
-            } else {
-                // Clear all IPv4 and IPv6 before proceeding to RunningState.
-                // Clean up any leftover state from an abnormal exit from
-                // tethering or during an IpClient restart.
-                stopAllIP();
-            }
-
             mCallback.setNeighborDiscoveryOffload(true);
+            ensureIpAddressesCleared();
         }
 
         @Override
         public boolean processMessage(Message msg) {
+            if (super.processMessage(msg) == HANDLED) return HANDLED;
             switch (msg.what) {
-                case CMD_ADDRESSES_CLEARED:
-                    transitionTo(isUsingPreconnection() ? mPreconnectingState : mRunningState);
-                    break;
-
-                case EVENT_NETLINK_LINKPROPERTIES_CHANGED:
-                    handleLinkPropertiesUpdate(NO_CALLBACKS);
-                    if (readyToProceed()) {
-                        transitionTo(isUsingPreconnection() ? mPreconnectingState : mRunningState);
-                    }
-                    break;
-
                 case CMD_STOP:
                 case EVENT_PROVISIONING_TIMEOUT:
                     // Fall through to StartedState.
@@ -2217,9 +2355,29 @@ public class IpClient extends StateMachine {
             }
             return HANDLED;
         }
+    }
 
-        private boolean readyToProceed() {
-            return !mLinkProperties.hasIpv4Address() && !mLinkProperties.hasGlobalIpv6Address();
+    class ClearAddressesOnStopState extends ClearAddressesState {
+        @Override
+        protected State getTargetState() {
+            return mStoppedState;
+        }
+
+        @Override
+        public void enter() {
+            ensureIpAddressesCleared();
+        }
+
+        @Override
+        public boolean processMessage(Message msg) {
+            if (super.processMessage(msg) == HANDLED) return HANDLED;
+            switch (msg.what) {
+                default:
+                    // Any messages which are not processed in ClearAddressesState will be
+                    // deferred to StoppedState.
+                    deferMessage(msg);
+            }
+            return HANDLED;
         }
     }
 
@@ -2406,8 +2564,6 @@ public class IpClient extends StateMachine {
                 mApfFilter.shutdown();
                 mApfFilter = null;
             }
-
-            resetLinkProperties();
         }
 
         private void enqueueJumpToStoppingState(final DisconnectCode code) {
