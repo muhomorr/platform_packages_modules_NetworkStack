@@ -19,8 +19,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
   package="com.android.networkstack"
   android:sharedUserId="android.uid.networkstack"
-  android:versionCode="331110020"
-  android:versionName="aml_net_331110020"
+  android:versionCode="331110080"
+  android:versionName="aml_net_331110080"
   coreApp="true"
 >
     <!--- Defines the MAINLINE_NETWORK_STACK permission used by the networkstack process. -->
