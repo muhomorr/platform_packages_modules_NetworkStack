@@ -166,6 +166,11 @@ public class NetworkStackUtils {
     public static final String DHCP_RAPID_COMMIT_ENABLED = "dhcp_rapid_commit_enabled";
 
     /**
+     * Disable dropping DHCP packets with IPv4 MF flag set.
+     */
+    public static final String DHCP_DISABLE_DROP_MF = "dhcp_disable_drop_mf";
+
+    /**
      * Minimum module version at which to enable the DHCP INIT-REBOOT state.
      */
     public static final String DHCP_INIT_REBOOT_VERSION = "dhcp_init_reboot_version";
@@ -192,14 +197,6 @@ public class NetworkStackUtils {
      */
     public static final String DHCP_SLOW_RETRANSMISSION_VERSION =
             "dhcp_slow_retransmission_version";
-
-    /**
-     * Minimum module version at which to enable dismissal CaptivePortalLogin app in validated
-     * network feature. CaptivePortalLogin app will also use validation facilities in
-     * {@link NetworkMonitor} to perform portal validation if feature is enabled.
-     */
-    public static final String DISMISS_PORTAL_IN_VALIDATED_NETWORK =
-            "dismiss_portal_in_validated_network";
 
     /**
      * Experiment flag to enable considering DNS probes returning private IP addresses as failed
@@ -321,7 +318,8 @@ public class NetworkStackUtils {
     /**
      * Attaches a socket filter that accepts DHCP packets to the given socket.
      */
-    public static native void attachDhcpFilter(FileDescriptor fd) throws ErrnoException;
+    public static native void attachDhcpFilter(FileDescriptor fd, boolean dropMF)
+            throws ErrnoException;
 
     /**
      * Attaches a socket filter that accepts ICMPv6 router advertisements to the given socket.
