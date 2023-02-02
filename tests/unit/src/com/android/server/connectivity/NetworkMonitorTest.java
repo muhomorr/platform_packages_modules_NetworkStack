@@ -55,6 +55,9 @@ import static com.android.net.module.util.NetworkStackConstants.TEST_CAPTIVE_POR
 import static com.android.net.module.util.NetworkStackConstants.TEST_URL_EXPIRATION_TIME;
 import static com.android.networkstack.util.DnsUtils.PRIVATE_DNS_PROBE_HOST_SUFFIX;
 import static com.android.networkstack.util.NetworkStackUtils.CAPTIVE_PORTAL_FALLBACK_PROBE_SPECS;
+import static com.android.networkstack.util.NetworkStackUtils.CAPTIVE_PORTAL_MODE;
+import static com.android.networkstack.util.NetworkStackUtils.CAPTIVE_PORTAL_MODE_IGNORE;
+import static com.android.networkstack.util.NetworkStackUtils.CAPTIVE_PORTAL_MODE_PROMPT;
 import static com.android.networkstack.util.NetworkStackUtils.CAPTIVE_PORTAL_OTHER_FALLBACK_URLS;
 import static com.android.networkstack.util.NetworkStackUtils.CAPTIVE_PORTAL_USE_HTTPS;
 import static com.android.networkstack.util.NetworkStackUtils.DEFAULT_CAPTIVE_PORTAL_DNS_PROBE_TIMEOUT;
@@ -617,8 +620,18 @@ public class NetworkMonitorTest {
         }
     }
 
-    private TcpSocketTracker getTcpSocketTrackerOrNull(NetworkMonitor.Dependencies dp) {
-        return ((dp.getDeviceConfigPropertyInt(
+    private boolean getIsCaptivePortalCheckEnabled(Context context,
+                NetworkMonitor.Dependencies dp) {
+        String symbol = CAPTIVE_PORTAL_MODE;
+        int defaultValue = CAPTIVE_PORTAL_MODE_PROMPT;
+        int mode = dp.getSetting(context, symbol, defaultValue);
+        return mode != CAPTIVE_PORTAL_MODE_IGNORE;
+    }
+
+    private TcpSocketTracker getTcpSocketTrackerOrNull(Context context,
+                NetworkMonitor.Dependencies dp) {
+        return (getIsCaptivePortalCheckEnabled(context, dp)
+                && (dp.getDeviceConfigPropertyInt(
                 NAMESPACE_CONNECTIVITY,
                 CONFIG_DATA_STALL_EVALUATION_TYPE,
                 DEFAULT_DATA_STALL_EVALUATION_TYPES)
@@ -631,7 +644,7 @@ public class NetworkMonitorTest {
 
         WrappedNetworkMonitor() {
             super(mContext, mCallbacks, mNetwork, mLogger, mValidationLogger, mServiceManager,
-                    mDependencies, getTcpSocketTrackerOrNull(mDependencies));
+                    mDependencies, getTcpSocketTrackerOrNull(mContext, mDependencies));
         }
 
         @Override
@@ -936,6 +949,16 @@ public class NetworkMonitorTest {
         assertEquals(wnm.getContext(), wnm.getCustomizedContextOrDefault());
     }
 
+    private void checkCustomizedContextByCarrierId(WrappedNetworkMonitor wnm, int carrierId) {
+        doReturn(carrierId).when(mTelephony).getSimCarrierId();
+        assertNotNull(wnm.getMccMncOverrideInfo());
+        // Check if the mcc & mnc has changed as expected.
+        assertEquals(460,
+                wnm.getCustomizedContextOrDefault().getResources().getConfiguration().mcc);
+        assertEquals(03,
+                wnm.getCustomizedContextOrDefault().getResources().getConfiguration().mnc);
+    }
+
     @Test
     public void testGetMccMncOverrideInfo() {
         final WrappedNetworkMonitor wnm = makeCellNotMeteredNetworkMonitor();
@@ -944,13 +967,10 @@ public class NetworkMonitorTest {
         doReturn(1839).when(mTelephony).getSimCarrierId();
         assertNull(wnm.getMccMncOverrideInfo());
         // 1854 is CTC's carrier id.
-        doReturn(1854).when(mTelephony).getSimCarrierId();
-        assertNotNull(wnm.getMccMncOverrideInfo());
-        // Check if the mcc & mnc has changed as expected.
-        assertEquals(460,
-                wnm.getCustomizedContextOrDefault().getResources().getConfiguration().mcc);
-        assertEquals(03,
-                wnm.getCustomizedContextOrDefault().getResources().getConfiguration().mnc);
+        // This line should be removed when the production code is corrected.
+        checkCustomizedContextByCarrierId(wnm, 1854);
+        // 2237 is CT's carrier id.
+        checkCustomizedContextByCarrierId(wnm, 2237);
         // Every mcc and mnc should be set in sCarrierIdToMccMnc.
         // Check if there is any unset value in mcc or mnc.
         for (int i = 0; i < wnm.sCarrierIdToMccMnc.size(); i++) {
@@ -1749,6 +1769,17 @@ public class NetworkMonitorTest {
         WrappedNetworkMonitor wrappedMonitor = makeCellMeteredNetworkMonitor();
         wrappedMonitor.setLastProbeTime(SystemClock.elapsedRealtime() - 100);
         assertFalse(wrappedMonitor.isDataStall());
+    }
+
+    @Test
+    public void testIsDataStall_EvaluationDisabledOnIgnorePortal() {
+        setCaptivePortalMode(Settings.Global.CAPTIVE_PORTAL_MODE_IGNORE);
+        setDataStallEvaluationType(DATA_STALL_EVALUATION_TYPE_DNS);
+        final WrappedNetworkMonitor nm = makeCellMeteredNetworkMonitor();
+        nm.setLastProbeTime(SystemClock.elapsedRealtime() - 1000);
+
+        assertNull(nm.getDnsStallDetector());
+        assertFalse(nm.isDataStall());
     }
 
     @Test
@@ -3272,4 +3303,3 @@ public class NetworkMonitorTest {
         assertEquals(isPortal ? 2 : 1, mRegisteredReceivers.size());
     }
 }
-

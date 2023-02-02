@@ -66,8 +66,10 @@ import com.android.internal.util.IndentingPrintWriter;
 import com.android.net.module.util.CollectionUtils;
 import com.android.net.module.util.ConnectivityUtils;
 import com.android.net.module.util.InterfaceParams;
+import com.android.net.module.util.SocketUtils;
 import com.android.networkstack.util.NetworkStackUtils;
 
+import java.io.ByteArrayOutputStream;
 import java.io.FileDescriptor;
 import java.io.IOException;
 import java.net.Inet4Address;
@@ -79,8 +81,10 @@ import java.net.UnknownHostException;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 /**
  * For networks that support packet filtering via APF programs, {@code ApfFilter}
@@ -143,6 +147,7 @@ public class ApfFilter {
         PASSED_ARP_UNKNOWN,
         PASSED_ARP_UNICAST_REPLY,
         PASSED_NON_IP_UNICAST,
+        PASSED_MDNS,
         DROPPED_ETH_BROADCAST,
         DROPPED_RA,
         DROPPED_GARP_REPLY,
@@ -161,7 +166,8 @@ public class ApfFilter {
         DROPPED_ARP_REPLY_SPA_NO_HOST,
         DROPPED_IPV4_KEEPALIVE_ACK,
         DROPPED_IPV6_KEEPALIVE_ACK,
-        DROPPED_IPV4_NATT_KEEPALIVE;
+        DROPPED_IPV4_NATT_KEEPALIVE,
+        DROPPED_MDNS;
 
         // Returns the negative byte offset from the end of the APF data segment for
         // a given counter.
@@ -212,7 +218,7 @@ public class ApfFilter {
         public void halt() {
             mStopped = true;
             // Interrupts the read() call the thread is blocked in.
-            NetworkStackUtils.closeSocketQuietly(mSocket);
+            SocketUtils.closeSocketQuietly(mSocket);
         }
 
         @Override
@@ -341,6 +347,22 @@ public class ApfFilter {
     // Limit on the Black List size to cap on program usage for this
     // TODO: Select a proper max length
     private static final int APF_MAX_ETH_TYPE_BLACK_LIST_LEN = 20;
+
+    private static final byte[] ETH_MULTICAST_MDNS_V4_MAC_ADDRESS =
+            {(byte) 0x01, (byte) 0x00, (byte) 0x5e, (byte) 0x00, (byte) 0x00, (byte) 0xfb};
+    private static final byte[] ETH_MULTICAST_MDNS_V6_MAC_ADDRESS =
+            {(byte) 0x33, (byte) 0x33, (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0xfb};
+    private static final int MDNS_PORT = 5353;
+    private static final int DNS_HEADER_LEN = 12;
+    private static final int DNS_QDCOUNT_OFFSET = 4;
+    // NOTE: this must be added to the IPv4 header length in IPV4_HEADER_SIZE_MEMORY_SLOT, or the
+    // IPv6 header length.
+    private static final int MDNS_QDCOUNT_OFFSET =
+            ETH_HEADER_LEN + UDP_HEADER_LEN + DNS_QDCOUNT_OFFSET;
+    private static final int MDNS_QNAME_OFFSET =
+            ETH_HEADER_LEN + UDP_HEADER_LEN + DNS_HEADER_LEN;
+
+
 
     private final ApfCapabilities mApfCapabilities;
     private final IpClientCallbacksWrapper mIpClientCallback;
@@ -903,13 +925,21 @@ public class ApfFilter {
 
         // Append a filter for this RA to {@code gen}. Jump to DROP_LABEL if it should be dropped.
         // Jump to the next filter if packet doesn't match this RA.
+        // Return Long.MAX_VALUE if we don't install any filter program for this RA. As the return
+        // value of this function is used to calculate the program min lifetime (which corresponds
+        // to the smallest generated filter lifetime). Returning Long.MAX_VALUE in the case no
+        // filter gets generated makes sure the program lifetime stays unaffected.
         @GuardedBy("ApfFilter.this")
         long generateFilterLocked(ApfGenerator gen) throws IllegalInstructionException {
+            // Filter for a fraction of the lifetime and adjust for the age of the RA.
+            int filterLifetime = (int) (mMinLifetime / FRACTION_OF_LIFETIME_TO_FILTER)
+                    - (int) (mProgramBaseTime - mLastSeen);
+            if (filterLifetime <= 0) return Long.MAX_VALUE;
+
             String nextFilterLabel = "Ra" + getUniqueNumberLocked();
             // Skip if packet is not the right size
             gen.addLoadFromMemory(Register.R0, gen.PACKET_SIZE_MEMORY_SLOT);
             gen.addJumpIfR0NotEquals(mPacket.capacity(), nextFilterLabel);
-            int filterLifetime = (int)(currentLifetime() / FRACTION_OF_LIFETIME_TO_FILTER);
             // Skip filter if expired
             gen.addLoadFromMemory(Register.R0, gen.FILTER_AGE_MEMORY_SLOT);
             gen.addJumpIfR0GreaterThan(filterLifetime, nextFilterLabel);
@@ -1166,6 +1196,8 @@ public class ApfFilter {
     private ArrayList<Ra> mRas = new ArrayList<>();
     @GuardedBy("this")
     private SparseArray<KeepalivePacket> mKeepalivePackets = new SparseArray<>();
+    @GuardedBy("this")
+    private final List<String[]> mMdnsAllowList = new ArrayList<>();
 
     // There is always some marginal benefit to updating the installed APF program when an RA is
     // seen because we can extend the program's lifetime slightly, but there is some cost to
@@ -1177,6 +1209,11 @@ public class ApfFilter {
     // packets may be dropped, so let's use 6.
     private static final int FRACTION_OF_LIFETIME_TO_FILTER = 6;
 
+    // The base time for this filter program. In seconds since Unix Epoch.
+    // This is the time when the APF program was generated. All filters in the program should use
+    // this base time as their current time for consistency purposes.
+    @GuardedBy("this")
+    private long mProgramBaseTime;
     // When did we last install a filter program? In seconds since Unix Epoch.
     @GuardedBy("this")
     private long mLastTimeInstalledProgram;
@@ -1479,6 +1516,124 @@ public class ApfFilter {
         gen.defineLabel(skipUnsolicitedMulticastNALabel);
     }
 
+    /** Encodes qname in TLV pattern. */
+    @VisibleForTesting
+    public static byte[] encodeQname(String[] labels) {
+        final ByteArrayOutputStream out = new ByteArrayOutputStream();
+        for (String label : labels) {
+            byte[] labelBytes = label.getBytes(StandardCharsets.UTF_8);
+            out.write(labelBytes.length);
+            out.write(labelBytes, 0, labelBytes.length);
+        }
+        out.write(0);
+        return out.toByteArray();
+    }
+
+    /**
+     * Generate filter code to process mDNS packets. Execution of this code ends in * DROP_LABEL
+     * or PASS_LABEL if the packet is mDNS packets. Otherwise, skip this check.
+     */
+    @GuardedBy("this")
+    private void generateMdnsFilterLocked(ApfGenerator gen)
+            throws IllegalInstructionException {
+        final String skipMdnsv4Filter = "skip_mdns_v4_filter";
+        final String skipMdnsFilter = "skip_mdns_filter";
+        final String checkMdnsUdpPort = "check_mdns_udp_port";
+        final String mDnsAcceptPacket = "mdns_accept_packet";
+        final String mDnsDropPacket = "mdns_drop_packet";
+
+        // Only turn on the filter if multicast filter is on and the qname allowlist is non-empty.
+        if (!mMulticastFilter || mMdnsAllowList.isEmpty()) {
+            return;
+        }
+
+        // Here's a basic summary of what the mDNS filter program does:
+        //
+        // if it is a multicast mDNS packet
+        //    if QDCOUNT > 1 and the first QNAME is in the allowlist
+        //       pass
+        //    else:
+        //       drop
+        //
+        // A packet is considered as a multicast mDNS packet if it matches all the following
+        // conditions
+        //   1. its destination MAC address matches 01:00:5E:00:00:FB or 33:33:00:00:00:FB, for
+        //   v4 and v6 respectively.
+        //   2. it is an IPv4/IPv6 packet
+        //   3. it is a UDP packet with port 5353
+
+        // Check it's L2 mDNS multicast address.
+        gen.addLoadImmediate(Register.R0, ETH_DEST_ADDR_OFFSET);
+        gen.addJumpIfBytesNotEqual(Register.R0, ETH_MULTICAST_MDNS_V4_MAC_ADDRESS,
+                skipMdnsv4Filter);
+
+        // Checks it's IPv4.
+        gen.addLoad16(Register.R0, ETH_ETHERTYPE_OFFSET);
+        gen.addJumpIfR0NotEquals(ETH_P_IP, skipMdnsFilter);
+
+        // Checks it's UDP.
+        gen.addLoad8(Register.R0, IPV4_PROTOCOL_OFFSET);
+        gen.addJumpIfR0NotEquals(IPPROTO_UDP, skipMdnsFilter);
+        // Set R1 to IPv4 header.
+        gen.addLoadFromMemory(Register.R1, gen.IPV4_HEADER_SIZE_MEMORY_SLOT);
+        gen.addJump(checkMdnsUdpPort);
+
+        gen.defineLabel(skipMdnsv4Filter);
+
+        // Checks it's L2 mDNS multicast address.
+        // Relies on R0 containing the ethernet destination mac address offset.
+        gen.addJumpIfBytesNotEqual(Register.R0, ETH_MULTICAST_MDNS_V6_MAC_ADDRESS,
+                skipMdnsFilter);
+
+        // Checks it's IPv6.
+        gen.addLoad16(Register.R0, ETH_ETHERTYPE_OFFSET);
+        gen.addJumpIfR0NotEquals(ETH_P_IPV6, skipMdnsFilter);
+
+        // Checks it's UDP.
+        gen.addLoad8(Register.R0, IPV6_NEXT_HEADER_OFFSET);
+        gen.addJumpIfR0NotEquals(IPPROTO_UDP, skipMdnsFilter);
+
+        // Set R1 to IPv6 header.
+        gen.addLoadImmediate(Register.R1, IPV6_HEADER_LEN);
+
+        // Checks it's mDNS UDP port
+        gen.defineLabel(checkMdnsUdpPort);
+        gen.addLoad16Indexed(Register.R0, UDP_DESTINATION_PORT_OFFSET);
+        gen.addJumpIfR0NotEquals(MDNS_PORT, skipMdnsFilter);
+
+        // Only do the QNAME check if the QDCOUNT is more than 0.
+        // If there is more than one query (QDCOUNT > 1), we only matches the first QNAME.
+        gen.addLoad16Indexed(Register.R0, MDNS_QDCOUNT_OFFSET);
+        gen.addJumpIfR0Equals(0, mDnsDropPacket);
+
+        // Load offset for the first QNAME.
+        gen.addLoadImmediate(Register.R0, MDNS_QNAME_OFFSET);
+        gen.addAddR1();
+
+        // Check first QNAME against allowlist
+        for (int i = 0; i < mMdnsAllowList.size(); ++i) {
+            final String mDnsNextAllowedQnameCheck = "mdns_next_allowed_qname_check" + i;
+            final byte[] encodedQname = encodeQname(mMdnsAllowList.get(i));
+            gen.addJumpIfBytesNotEqual(Register.R0, encodedQname, mDnsNextAllowedQnameCheck);
+            // QNAME matched
+            gen.addJump(mDnsAcceptPacket);
+            // QNAME not matched
+            gen.defineLabel(mDnsNextAllowedQnameCheck);
+        }
+        // If QNAME doesn't match any entries in allowlist, drop the packet.
+        gen.defineLabel(mDnsDropPacket);
+        maybeSetupCounter(gen, Counter.DROPPED_MDNS);
+        gen.addJump(mCountAndDropLabel);
+
+        gen.defineLabel(mDnsAcceptPacket);
+        maybeSetupCounter(gen, Counter.PASSED_MDNS);
+        gen.addJump(mCountAndPassLabel);
+
+
+        gen.defineLabel(skipMdnsFilter);
+    }
+
+
     private void generateV6KeepaliveFilters(ApfGenerator gen) throws IllegalInstructionException {
         generateKeepaliveFilters(gen, TcpKeepaliveAckV6.class, IPPROTO_TCP, IPV6_NEXT_HEADER_OFFSET,
                 "skip_v6_keepalive_filter");
@@ -1553,19 +1708,20 @@ public class ApfFilter {
         generateArpFilterLocked(gen);
         gen.defineLabel(skipArpFiltersLabel);
 
+        // Add mDNS filter:
+        generateMdnsFilterLocked(gen);
+        gen.addLoad16(Register.R0, ETH_ETHERTYPE_OFFSET);
+
         // Add IPv4 filters:
         String skipIPv4FiltersLabel = "skipIPv4Filters";
-        // NOTE: Relies on R0 containing ethertype. This is safe because if we got here, we did not
-        // execute the ARP filter, since that filter does not fall through, but either drops or
-        // passes.
         gen.addJumpIfR0NotEquals(ETH_P_IP, skipIPv4FiltersLabel);
         generateIPv4FilterLocked(gen);
         gen.defineLabel(skipIPv4FiltersLabel);
 
         // Check for IPv6:
-        // NOTE: Relies on R0 containing ethertype. This is safe because if we got here, we did not
-        // execute the ARP or IPv4 filters, since those filters do not fall through, but either
-        // drop or pass.
+        // NOTE: Relies on R0 containing ethertype. This is safe because if we got here, we did
+        // not execute the IPv4 filter, since this filter do not fall through, but either drop or
+        // pass.
         String ipv6FilterLabel = "IPv6Filters";
         gen.addJumpIfR0Equals(ETH_P_IPV6, ipv6FilterLabel);
 
@@ -1631,6 +1787,7 @@ public class ApfFilter {
             maximumApfProgramSize -= Counter.totalSize();
         }
 
+        mProgramBaseTime = currentTimeSeconds();
         try {
             // Step 1: Determine how many RA filters we can fit in the program.
             ApfGenerator gen = emitPrologueLocked();
@@ -1667,8 +1824,8 @@ public class ApfFilter {
             Log.e(TAG, "Failed to generate APF program.", e);
             return;
         }
-        final long now = currentTimeSeconds();
-        mLastTimeInstalledProgram = now;
+        mIpClientCallback.installPacketFilter(program);
+        mLastTimeInstalledProgram = mProgramBaseTime;
         mLastInstalledProgramMinLifetime = programMinLifetime;
         mLastInstalledProgram = program;
         mNumProgramUpdates++;
@@ -1676,8 +1833,7 @@ public class ApfFilter {
         if (VDBG) {
             hexDump("Installing filter: ", program, program.length);
         }
-        mIpClientCallback.installPacketFilter(program);
-        logApfProgramEventLocked(now);
+        logApfProgramEventLocked(mProgramBaseTime);
         mLastInstallEvent = new ApfProgramEvent.Builder()
                 .setLifetime(programMinLifetime)
                 .setFilteredRas(rasToFilter.size())
@@ -1827,6 +1983,22 @@ public class ApfFilter {
             mNumProgramUpdatesAllowingMulticast++;
         }
         installNewProgramLocked();
+    }
+
+    /** Adds qname to the mDNS allowlist */
+    public synchronized void addToMdnsAllowList(String[] labels) {
+        mMdnsAllowList.add(labels);
+        if (mMulticastFilter) {
+            installNewProgramLocked();
+        }
+    }
+
+    /** Removes qname from the mDNS allowlist */
+    public synchronized void removeFromAllowList(String[] labels) {
+        mMdnsAllowList.removeIf(e -> Arrays.equals(labels, e));
+        if (mMulticastFilter) {
+            installNewProgramLocked();
+        }
     }
 
     @VisibleForTesting

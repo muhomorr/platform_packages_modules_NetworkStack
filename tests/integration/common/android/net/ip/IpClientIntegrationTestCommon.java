@@ -59,6 +59,7 @@ import static com.android.net.module.util.NetworkStackConstants.ICMPV6_ROUTER_SO
 import static com.android.net.module.util.NetworkStackConstants.IPV4_ADDR_ANY;
 import static com.android.net.module.util.NetworkStackConstants.IPV6_ADDR_ALL_NODES_MULTICAST;
 import static com.android.net.module.util.NetworkStackConstants.IPV6_ADDR_ALL_ROUTERS_MULTICAST;
+import static com.android.net.module.util.NetworkStackConstants.IPV6_ADDR_ANY;
 import static com.android.net.module.util.NetworkStackConstants.IPV6_HEADER_LEN;
 import static com.android.net.module.util.NetworkStackConstants.IPV6_PROTOCOL_OFFSET;
 import static com.android.net.module.util.NetworkStackConstants.NEIGHBOR_ADVERTISEMENT_FLAG_OVERRIDE;
@@ -88,6 +89,7 @@ import static org.mockito.ArgumentMatchers.longThat;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.argThat;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.eq;
@@ -2850,7 +2852,7 @@ public abstract class IpClientIntegrationTestCommon {
         assertTrue(lp.getDnsServers().contains(InetAddress.getByName(dnsServer)));
         assertTrue(lp.getDnsServers().contains(SERVER_ADDR));
 
-        reset(mCb);
+        clearInvocations(mCb);
     }
 
     private void doDualStackProvisioning(boolean shouldDisableAcceptRa) throws Exception {
@@ -3711,6 +3713,23 @@ public abstract class IpClientIntegrationTestCommon {
         return nsList;
     }
 
+    private NeighborSolicitation expectDadNeighborSolicitationForLinkLocal(boolean shouldDisableDad)
+            throws Exception {
+        final NeighborSolicitation ns = getNextNeighborSolicitation();
+        if (!shouldDisableDad) {
+            final Inet6Address solicitedNodeMulticast =
+                    NetworkStackUtils.ipv6AddressToSolicitedNodeMulticast(ns.nsHdr.target);
+            assertNotNull("No multicast NS received on interface within timeout", ns);
+            assertEquals(IPV6_ADDR_ANY, ns.ipv6Hdr.srcIp);     // srcIp: ::/
+            assertTrue(ns.ipv6Hdr.dstIp.isMulticastAddress()); // dstIp: solicited-node mcast
+            assertTrue(ns.ipv6Hdr.dstIp.equals(solicitedNodeMulticast));
+            assertTrue(ns.nsHdr.target.isLinkLocalAddress());  // targetIp: IPv6 LL address
+        } else {
+            assertNull(ns);
+        }
+        return ns;
+    }
+
     // Override this function with disabled experiment flag by default, in order not to
     // affect those tests which are just related to basic IpReachabilityMonitor infra.
     private void prepareIpReachabilityMonitorTest() throws Exception {
@@ -3957,6 +3976,59 @@ public abstract class IpClientIntegrationTestCommon {
         );
     }
 
+    private void runIpv6LinkLocalOnlyDadTransmitsCheckTest(boolean shouldDisableDad)
+            throws Exception {
+        ProvisioningConfiguration.Builder config = new ProvisioningConfiguration.Builder()
+                .withoutIPv4()
+                .withIpv6LinkLocalOnly()
+                .withRandomMacAddress();
+        if (shouldDisableDad) config.withUniqueEui64AddressesOnly();
+
+        // dad_transmits has been set to 0 in disableIpv6ProvisioningDelays, re-enable dad_transmits
+        // for testing, but production code could disable dad again later, we should never see any
+        // multicast NS for duplicate address detection then.
+        mNetd.setProcSysNet(INetd.IPV6, INetd.CONF, mIfaceName, "dad_transmits", "1");
+        startIpClientProvisioning(config.build());
+        verify(mNetd, timeout(TEST_TIMEOUT_MS)).interfaceSetEnableIPv6(mIfaceName, true);
+        // Check dad_transmits should be set to 0 if UniqueEui64AddressesOnly mode is enabled.
+        int dadTransmits = Integer.parseUnsignedInt(
+                mNetd.getProcSysNet(INetd.IPV6, INetd.CONF, mIfaceName, "dad_transmits"));
+        if (shouldDisableDad) {
+            assertEquals(0, dadTransmits);
+        } else {
+            assertEquals(1, dadTransmits);
+        }
+
+        final NeighborSolicitation ns =
+                expectDadNeighborSolicitationForLinkLocal(shouldDisableDad);
+        if (shouldDisableDad) {
+            assertNull(ns);
+        } else {
+            assertNotNull(ns);
+        }
+
+        // Shutdown IpClient and check if the dad_transmits always equals to default value 1 (if
+        // dad_transmit was set to 0 before, it should get recovered to default value 1 after
+        // shutting down IpClient)
+        mIpc.shutdown();
+        awaitIpClientShutdown();
+        dadTransmits = Integer.parseUnsignedInt(
+                mNetd.getProcSysNet(INetd.IPV6, INetd.CONF, mIfaceName, "dad_transmits"));
+        assertEquals(1, dadTransmits);
+    }
+
+    @Test
+    @SignatureRequiredTest(reason = "requires mocked netd")
+    public void testIPv6LinkLocalOnly_enableDad() throws Exception {
+        runIpv6LinkLocalOnlyDadTransmitsCheckTest(false /* shouldDisableDad */);
+    }
+
+    @Test
+    @SignatureRequiredTest(reason = "requires mocked netd")
+    public void testIPv6LinkLocalOnly_disableDad() throws Exception {
+        runIpv6LinkLocalOnlyDadTransmitsCheckTest(true /* shouldDisableDad */);
+    }
+
     // Since createTapInterface(boolean, String) method was introduced since T, this method
     // cannot be found on Q/R/S platform, ignore this test on T- platform.
     @Test
@@ -4088,8 +4160,31 @@ public abstract class IpClientIntegrationTestCommon {
         assertFalse(lp.hasGlobalIpv6Address());
         assertEquals(3, lp.getLinkAddresses().size()); // IPv6 privacy, stable privacy, link-local
         for (LinkAddress la : lp.getLinkAddresses()) {
-            final Inet6Address address = (Inet6Address) la.getAddress();
             assertFalse(NetworkStackUtils.isIPv6GUA(la));
         }
+    }
+
+    @Test @SignatureRequiredTest(reason = "requires mNetd to delete IPv6 GUAs")
+    public void testOnIpv6AddressRemoved() throws Exception {
+        ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
+                .withoutIPv4()
+                .build();
+        startIpClientProvisioning(config);
+
+        LinkProperties lp = doIpv6OnlyProvisioning();
+        assertNotNull(lp);
+        assertEquals(3, lp.getLinkAddresses().size()); // IPv6 privacy, stable privacy, link-local
+        for (LinkAddress la : lp.getLinkAddresses()) {
+            final Inet6Address address = (Inet6Address) la.getAddress();
+            if (address.isLinkLocalAddress()) continue;
+            // Remove IPv6 GUAs from interface.
+            mNetd.interfaceDelAddress(mIfaceName, address.getHostAddress(), la.getPrefixLength());
+        }
+
+        final ArgumentCaptor<LinkProperties> captor = ArgumentCaptor.forClass(LinkProperties.class);
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).onProvisioningFailure(captor.capture());
+        lp = captor.getValue();
+        assertFalse(lp.hasGlobalIpv6Address());
+        assertEquals(1, lp.getLinkAddresses().size()); // only link-local
     }
 }
