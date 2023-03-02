@@ -18,6 +18,7 @@ package android.net.ip;
 
 import static android.Manifest.permission.MANAGE_TEST_NETWORKS;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET;
+import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_ROAMING;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_SUSPENDED;
 import static android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN;
@@ -36,7 +37,6 @@ import static android.net.dhcp.DhcpPacket.MIN_V6ONLY_WAIT_MS;
 import static android.net.dhcp.DhcpResultsParcelableUtil.fromStableParcelable;
 import static android.net.ip.IpClientLinkObserver.CLAT_PREFIX;
 import static android.net.ip.IpClientLinkObserver.CONFIG_SOCKET_RECV_BUFSIZE;
-import static android.net.ip.IpReachabilityMonitor.MIN_NUD_SOLICIT_NUM;
 import static android.net.ip.IpReachabilityMonitor.NUD_MCAST_RESOLICIT_NUM;
 import static android.net.ip.IpReachabilityMonitor.nudEventTypeToInt;
 import static android.net.ipmemorystore.Status.SUCCESS;
@@ -121,6 +121,7 @@ import android.net.Layer2PacketParcelable;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.MacAddress;
+import android.net.Network;
 import android.net.NetworkAgentConfig;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
@@ -223,6 +224,8 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 import java.lang.reflect.Method;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.Inet4Address;
 import java.net.Inet6Address;
 import java.net.InetAddress;
@@ -384,6 +387,8 @@ public abstract class IpClientIntegrationTestCommon {
     private static final String IPV4_TEST_SUBNET_PREFIX = "192.168.1.0/24";
     private static final String IPV4_ANY_ADDRESS_PREFIX = "0.0.0.0/0";
     private static final String HOSTNAME = "testhostname";
+    private static final String IPV6_OFF_LINK_DNS_SERVER = "2001:4860:4860::64";
+    private static final String IPV6_ON_LINK_DNS_SERVER = "2001:db8:1::64";
     private static final int TEST_DEFAULT_MTU = 1500;
     private static final int TEST_MIN_MTU = 1280;
     private static final MacAddress ROUTER_MAC = MacAddress.fromString("00:1A:11:22:33:44");
@@ -571,6 +576,10 @@ public abstract class IpClientIntegrationTestCommon {
 
     protected abstract void assertIpMemoryNeverStoreNetworkAttributes(String l2Key, long timeout);
 
+    protected abstract int readNudSolicitNumInSteadyStateFromResource();
+
+    protected abstract int readNudSolicitNumPostRoamingFromResource();
+
     protected final boolean testSkipped() {
         if (!useNetworkStackSignature() && !TestNetworkStackServiceClient.isSupported()) {
             fail("Device running root tests doesn't support TestNetworkStackServiceClient.");
@@ -678,6 +687,7 @@ public abstract class IpClientIntegrationTestCommon {
         }
         if (mNetworkAgentThread != null) {
             mNetworkAgentThread.quitSafely();
+            mNetworkAgentThread.join();
         }
         teardownTapInterface();
         mIIpClient.shutdown();
@@ -719,13 +729,14 @@ public abstract class IpClientIntegrationTestCommon {
         return iface;
     }
 
-    private void teardownTapInterface() {
+    private void teardownTapInterface() throws Exception {
         if (mPacketReader != null) {
             mHandler.post(() -> mPacketReader.stop());  // Also closes the socket
             mTapFd = null;
         }
         if (mPacketReaderThread != null) {
             mPacketReaderThread.quitSafely();
+            mPacketReaderThread.join();
         }
     }
 
@@ -1585,6 +1596,7 @@ public abstract class IpClientIntegrationTestCommon {
                         .addCapability(NET_CAPABILITY_NOT_SUSPENDED)
                         .addCapability(NET_CAPABILITY_NOT_ROAMING)
                         .addCapability(NET_CAPABILITY_NOT_VPN)
+                        .addCapability(NET_CAPABILITY_NOT_RESTRICTED)
                         .addTransportType(TRANSPORT_TEST)
                         .setNetworkSpecifier(testNetworkSpecifier)
                         .build(),
@@ -1818,9 +1830,8 @@ public abstract class IpClientIntegrationTestCommon {
 
     private void sendRouterAdvertisement(boolean waitForRs, short lifetime, int valid,
             int preferred) throws Exception {
-        final String dnsServer = "2001:4860:4860::64";
         final ByteBuffer pio = buildPioOption(valid, preferred, "2001:db8:1::/64");
-        final ByteBuffer rdnss = buildRdnssOption(3600, dnsServer);
+        final ByteBuffer rdnss = buildRdnssOption(3600, IPV6_OFF_LINK_DNS_SERVER);
         sendRouterAdvertisement(waitForRs, lifetime, pio, rdnss);
     }
 
@@ -1908,9 +1919,8 @@ public abstract class IpClientIntegrationTestCommon {
 
     private LinkProperties doIpv6OnlyProvisioning() throws Exception {
         final InOrder inOrder = inOrder(mCb);
-        final String dnsServer = "2001:4860:4860::64";
         final ByteBuffer pio = buildPioOption(3600, 1800, "2001:db8:1::/64");
-        final ByteBuffer rdnss = buildRdnssOption(3600, dnsServer);
+        final ByteBuffer rdnss = buildRdnssOption(3600, IPV6_OFF_LINK_DNS_SERVER);
         final ByteBuffer slla = buildSllaOption();
         final ByteBuffer ra = buildRaPacket(pio, rdnss, slla);
 
@@ -2022,12 +2032,11 @@ public abstract class IpClientIntegrationTestCommon {
                 .build();
         startIpClientProvisioning(config);
 
-        final String dnsServer = "2001:4860:4860::64";
         final IpPrefix prefix = new IpPrefix("64:ff9b::/96");
         final IpPrefix otherPrefix = new IpPrefix("2001:db8:64::/96");
 
         final ByteBuffer pio = buildPioOption(600, 300, "2001:db8:1::/64");
-        ByteBuffer rdnss = buildRdnssOption(600, dnsServer);
+        ByteBuffer rdnss = buildRdnssOption(600, IPV6_OFF_LINK_DNS_SERVER);
         ByteBuffer pref64 = new StructNdOptPref64(prefix, 600).toByteBuffer();
         ByteBuffer ra = buildRaPacket(pio, rdnss, pref64);
 
@@ -2827,14 +2836,21 @@ public abstract class IpClientIntegrationTestCommon {
                 true /* shouldReplyNakOnRoam */);
     }
 
-    private void performDualStackProvisioning() throws Exception {
-        final InOrder inOrder = inOrder(mCb);
-        final CompletableFuture<LinkProperties> lpFuture = new CompletableFuture<>();
-        final String dnsServer = "2001:4860:4860::64";
+    private LinkProperties performDualStackProvisioning() throws Exception {
+        final Inet6Address dnsServer =
+                (Inet6Address) InetAddresses.parseNumericAddress(IPV6_OFF_LINK_DNS_SERVER);
         final ByteBuffer pio = buildPioOption(3600, 1800, "2001:db8:1::/64");
-        final ByteBuffer rdnss = buildRdnssOption(3600, dnsServer);
+        final ByteBuffer rdnss = buildRdnssOption(3600, IPV6_OFF_LINK_DNS_SERVER);
         final ByteBuffer slla = buildSllaOption();
         final ByteBuffer ra = buildRaPacket(pio, rdnss, slla);
+
+        return performDualStackProvisioning(ra, dnsServer);
+    }
+
+    private LinkProperties performDualStackProvisioning(final ByteBuffer ra,
+            final InetAddress dnsServer) throws Exception {
+        final InOrder inOrder = inOrder(mCb);
+        final CompletableFuture<LinkProperties> lpFuture = new CompletableFuture<>();
 
         doIpv6OnlyProvisioning(inOrder, ra);
 
@@ -2849,10 +2865,10 @@ public abstract class IpClientIntegrationTestCommon {
 
         final LinkProperties lp = lpFuture.get(TEST_TIMEOUT_MS, TimeUnit.MILLISECONDS);
         assertNotNull(lp);
-        assertTrue(lp.getDnsServers().contains(InetAddress.getByName(dnsServer)));
+        assertTrue(lp.getDnsServers().contains(dnsServer));
         assertTrue(lp.getDnsServers().contains(SERVER_ADDR));
 
-        clearInvocations(mCb);
+        return lp;
     }
 
     private void doDualStackProvisioning(boolean shouldDisableAcceptRa) throws Exception {
@@ -3166,6 +3182,7 @@ public abstract class IpClientIntegrationTestCommon {
     }
 
     private void shutdownAndRecreateIpClient() throws Exception {
+        clearInvocations(mCb);
         mIpc.shutdown();
         awaitIpClientShutdown();
         mIpc = makeIpClient();
@@ -3792,7 +3809,8 @@ public abstract class IpClientIntegrationTestCommon {
         prepareIpReachabilityMonitorTest();
 
         final List<NeighborSolicitation> nsList = waitForMultipleNeighborSolicitations();
-        assertEquals(MIN_NUD_SOLICIT_NUM, nsList.size());
+        final int expectedNudSolicitNum = readNudSolicitNumPostRoamingFromResource();
+        assertEquals(expectedNudSolicitNum, nsList.size());
         for (NeighborSolicitation ns : nsList) {
             assertUnicastNeighborSolicitation(ns, ROUTER_MAC /* dstMac */,
                     ROUTER_LINK_LOCAL /* dstIp */, ROUTER_LINK_LOCAL /* targetIp */);
@@ -3835,13 +3853,14 @@ public abstract class IpClientIntegrationTestCommon {
         prepareIpReachabilityMonitorTest(true /* isMulticastResolicitEnabled */);
 
         final List<NeighborSolicitation> nsList = waitForMultipleNeighborSolicitations();
-        int expectedSize = MIN_NUD_SOLICIT_NUM + NUD_MCAST_RESOLICIT_NUM;
-        assertEquals(expectedSize, nsList.size()); // 5 unicast NSes + 3 multicast NSes
-        for (NeighborSolicitation ns : nsList.subList(0, MIN_NUD_SOLICIT_NUM)) {
+        final int expectedNudSolicitNum = readNudSolicitNumPostRoamingFromResource();
+        int expectedSize = expectedNudSolicitNum + NUD_MCAST_RESOLICIT_NUM;
+        assertEquals(expectedSize, nsList.size());
+        for (NeighborSolicitation ns : nsList.subList(0, expectedNudSolicitNum)) {
             assertUnicastNeighborSolicitation(ns, ROUTER_MAC /* dstMac */,
                     ROUTER_LINK_LOCAL /* dstIp */, ROUTER_LINK_LOCAL /* targetIp */);
         }
-        for (NeighborSolicitation ns : nsList.subList(MIN_NUD_SOLICIT_NUM, nsList.size())) {
+        for (NeighborSolicitation ns : nsList.subList(expectedNudSolicitNum, nsList.size())) {
             assertMulticastNeighborSolicitation(ns, ROUTER_LINK_LOCAL /* targetIp */);
         }
     }
@@ -3904,6 +3923,132 @@ public abstract class IpClientIntegrationTestCommon {
                 NudEventType.NUD_POST_ROAMING_MAC_ADDRESS_CHANGED);
     }
 
+    private void sendUdpPacketToNetwork(final Network network, final Inet6Address remoteIp,
+            int port, final byte[] data) throws Exception {
+        final DatagramSocket socket = new DatagramSocket(0, (InetAddress) Inet6Address.ANY);
+        final DatagramPacket pkt = new DatagramPacket(data, data.length, remoteIp, port);
+        network.bindSocket(socket);
+        socket.send(pkt);
+    }
+
+    private void runIpReachabilityMonitorAddressResolutionTest(final String dnsServer,
+            final Inet6Address targetIp,
+            final boolean isIgnoreIncompleteIpv6DnsServerEnabled,
+            final boolean isIgnoreIncompleteIpv6DefaultRouterEnabled,
+            final boolean expectNeighborLost) throws Exception {
+        // This mock is required, otherwise, IpReachabilityMonitor#avoidingBadLinks() will always
+        // return false, that results in the target tested IPv6 off-link DNS server won't be removed
+        // from LP and notifyLost won't be invoked.
+        when(mCm.shouldAvoidBadWifi()).thenReturn(true);
+
+        mNetworkAgentThread =
+                new HandlerThread(IpClientIntegrationTestCommon.class.getSimpleName());
+        mNetworkAgentThread.start();
+
+        setDhcpFeatures(false /* isDhcpLeaseCacheEnabled */, true /* isRapidCommitEnabled */,
+                false /* isDhcpIpConflictDetectEnabled */,
+                false /* isIPv6OnlyPreferredEnabled */);
+        setFeatureEnabled(
+                NetworkStackUtils.IP_REACHABILITY_IGNORE_INCOMPLETE_IPV6_DNS_SERVER_VERSION,
+                isIgnoreIncompleteIpv6DnsServerEnabled);
+        setFeatureEnabled(
+                NetworkStackUtils.IP_REACHABILITY_IGNORE_INCOMPLETE_IPV6_DEFAULT_ROUTER_VERSION,
+                isIgnoreIncompleteIpv6DefaultRouterEnabled);
+        final ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
+                .build();
+        startIpClientProvisioning(config);
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).setFallbackMulticastFilter(false);
+
+        final List<ByteBuffer> options = new ArrayList<ByteBuffer>();
+        options.add(buildPioOption(3600, 1800, "2001:db8:1::/64")); // PIO
+        options.add(buildRdnssOption(3600, dnsServer));             // RDNSS
+        // If target IP of address resolution is default router's IPv6 link-local address,
+        // then we should not take SLLA option in RA.
+        if (!targetIp.equals(ROUTER_LINK_LOCAL)) {
+            options.add(buildSllaOption());                         // SLLA
+        }
+        final ByteBuffer ra = buildRaPacket(options.toArray(new ByteBuffer[options.size()]));
+        final Inet6Address dnsServerIp =
+                (Inet6Address) InetAddresses.parseNumericAddress(dnsServer);
+        final LinkProperties lp = performDualStackProvisioning(ra, dnsServerIp);
+        runAsShell(MANAGE_TEST_NETWORKS, () -> createTestNetworkAgentAndRegister(lp));
+
+        // Send a UDP packet to IPv6 DNS server to trigger address resolution process for IPv6
+        // on-link DNS server or default router(if the target is default router, we should pass
+        // in an IPv6 off-link DNS server such as 2001:db8:4860:4860::64).
+        final Random random = new Random();
+        final byte[] data = new byte[100];
+        random.nextBytes(data);
+        sendUdpPacketToNetwork(mNetworkAgent.getNetwork(), dnsServerIp, 1234 /* port */, data);
+
+        // Wait for the multicast NSes but never respond to them, that results in the on-link
+        // DNS gets lost and onReachabilityLost callback will be invoked.
+        final List<NeighborSolicitation> nsList = new ArrayList<NeighborSolicitation>();
+        NeighborSolicitation ns;
+        while ((ns = getNextNeighborSolicitation()) != null) {
+            // multicast NS for address resolution, IPv6 dst address in that NS is solicited-node
+            // multicast address based on the target IP, the target IP is either on-link IPv6 DNS
+            // server address or IPv6 link-local address of default gateway.
+            final LinkAddress actual = new LinkAddress(ns.nsHdr.target, 64);
+            final LinkAddress target = new LinkAddress(targetIp, 64);
+            if (actual.equals(target) && ns.ipv6Hdr.dstIp.isMulticastAddress()) {
+                nsList.add(ns);
+            }
+        }
+        assertFalse(nsList.isEmpty());
+
+        if (expectNeighborLost) {
+            assertNotifyNeighborLost(targetIp, NudEventType.NUD_ORGANIC_FAILED_CRITICAL);
+        } else {
+            assertNeverNotifyNeighborLost();
+        }
+    }
+
+    @Test
+    @SignatureRequiredTest(reason = "Need to mock NetworkAgent")
+    public void testIpReachabilityMonitor_incompleteIpv6DnsServerInDualStack() throws Exception {
+        final Inet6Address targetIp =
+                (Inet6Address) InetAddresses.parseNumericAddress(IPV6_ON_LINK_DNS_SERVER);
+        runIpReachabilityMonitorAddressResolutionTest(IPV6_ON_LINK_DNS_SERVER, targetIp,
+                true /* isIgnoreIncompleteIpv6DnsServerEnabled */,
+                false /* isIgnoreIncompleteIpv6DefaultRouterEnabled */,
+                false /* expectNeighborLost */);
+    }
+
+    @Test
+    @SignatureRequiredTest(reason = "Need to mock NetworkAgent")
+    public void testIpReachabilityMonitor_incompleteIpv6DnsServerInDualStack_flagoff()
+            throws Exception {
+        final Inet6Address targetIp =
+                (Inet6Address) InetAddresses.parseNumericAddress(IPV6_ON_LINK_DNS_SERVER);
+        runIpReachabilityMonitorAddressResolutionTest(IPV6_ON_LINK_DNS_SERVER, targetIp,
+                false /* isIgnoreIncompleteIpv6DnsServerEnabled */,
+                false /* isIgnoreIncompleteIpv6DefaultRouterEnabled */,
+                true /* expectNeighborLost */);
+    }
+
+    @Test
+    @SignatureRequiredTest(reason = "Need to mock the NetworkAgent")
+    public void testIpReachabilityMonitor_incompleteIpv6DefaultRouterInDualStack()
+            throws Exception {
+        runIpReachabilityMonitorAddressResolutionTest(IPV6_OFF_LINK_DNS_SERVER,
+                ROUTER_LINK_LOCAL /* targetIp */,
+                false /* isIgnoreIncompleteIpv6DnsServerEnabled */,
+                true /* isIgnoreIncompleteIpv6DefaultRouterEnabled */,
+                false /* expectNeighborLost */);
+    }
+
+    @Test
+    @SignatureRequiredTest(reason = "Need to mock the NetworkAgent")
+    public void testIpReachabilityMonitor_incompleteIpv6DefaultRouterInDualStack_flagoff()
+            throws Exception {
+        runIpReachabilityMonitorAddressResolutionTest(IPV6_OFF_LINK_DNS_SERVER,
+                ROUTER_LINK_LOCAL /* targetIp */,
+                false /* isIgnoreIncompleteIpv6DnsServerEnabled */,
+                false /* isIgnoreIncompleteIpv6DefaultRouterEnabled */,
+                true /* expectNeighborLost */);
+    }
+
     @Test
     public void testIPv6LinkLocalOnly() throws Exception {
         ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
@@ -3920,12 +4065,8 @@ public abstract class IpClientIntegrationTestCommon {
         assertEquals(0, lp.getDnsServers().size());
         final List<LinkAddress> addresses = lp.getLinkAddresses();
         assertEquals(1, addresses.size());
-        assertTrue(addresses.get(0).getAddress().isLinkLocalAddress());
-        assertEquals(1, lp.getRoutes().size());
-        final RouteInfo route = lp.getRoutes().get(0);
-        assertNotNull(route);
-        assertTrue(route.getDestination().equals(new IpPrefix("fe80::/64")));
-        assertTrue(route.getGateway().isAnyLocalAddress());
+        assertTrue(addresses.get(0).getAddress().isLinkLocalAddress()); // only IPv6 link-local
+        assertTrue(hasRouteTo(lp, IPV6_LINK_LOCAL_PREFIX)); // fe80::/64 -> :: iface mtu 0
 
         // Check that if an RA is received, no IP addresses, routes, or DNS servers are configured.
         // Instead of waiting some period of time for the RA to be received and checking the
@@ -4083,10 +4224,9 @@ public abstract class IpClientIntegrationTestCommon {
 
         // Send another RA with a different IPv6 global prefix. This PIO option should be dropped
         // due to the ENOBUFS happens, it means IpClient shouldn't see the new IPv6 global prefix.
-        final String dnsServer = "2001:4860:4860::64";
         final String prefix = "2001:db8:dead:beef::/64";
         final ByteBuffer pio = buildPioOption(3600, 1800, prefix);
-        ByteBuffer rdnss = buildRdnssOption(3600, dnsServer);
+        ByteBuffer rdnss = buildRdnssOption(3600, IPV6_OFF_LINK_DNS_SERVER);
         sendRouterAdvertisement(false /* waitForRs */, (short) 1800, pio, rdnss);
 
         // Unblock the IpClient handler and ENOBUFS should happen then.
